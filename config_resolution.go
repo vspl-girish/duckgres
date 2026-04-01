@@ -338,6 +338,27 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			}
 		}
 
+		if len(fileCfg.Attach) > 0 {
+			cfg.Attach = make([]server.AttachConfig, 0, len(fileCfg.Attach))
+			for i, a := range fileCfg.Attach {
+				if a.Path == "" {
+					warn("attach[" + strconv.Itoa(i) + "]: path is required, skipping")
+					continue
+				}
+				if a.Alias == "" {
+					warn("attach[" + strconv.Itoa(i) + "]: alias is required, skipping")
+					continue
+				}
+				cfg.Attach = append(cfg.Attach, server.AttachConfig{
+					Path:             a.Path,
+					Alias:            a.Alias,
+					ReadOnly:         a.ReadOnly,
+					DataPath:         a.DataPath,
+					OverrideDataPath: a.OverrideDataPath,
+				})
+			}
+		}
+
 		// Query log configuration
 		if fileCfg.QueryLog.Enabled != nil {
 			cfg.QueryLog.Enabled = *fileCfg.QueryLog.Enabled

@@ -190,6 +190,9 @@ type Config struct {
 
 	// QueryLog configures the DuckLake query log (system.query_log table).
 	QueryLog QueryLogConfig
+
+	// Attach lists additional DuckDB databases to attach on every new connection.
+	Attach []AttachConfig
 }
 
 // QueryLogConfig configures the query log feature.
@@ -199,6 +202,15 @@ type QueryLogConfig struct {
 	BatchSize            int
 	CompactInterval      time.Duration
 	DataInliningRowLimit int
+}
+
+// AttachConfig describes a single DuckDB database to attach on connection setup.
+type AttachConfig struct {
+	Path     string // database file path or connection string
+	Alias    string // name to attach as (e.g. ATTACH '...' AS alias)
+	ReadOnly bool   // attach in read-only mode
+	DataPath         string // DATA_PATH option (e.g. "s3://bucket/path/" or "/local/data")
+	OverrideDataPath bool   // OVERRIDE_DATA_PATH TRUE option
 }
 
 // DuckLakeConfig configures DuckLake catalog attachment
@@ -907,6 +919,9 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		}
 	}
 
+	// Attach any additional databases configured via the 'attach' section
+	AttachDatabases(db, cfg.Attach)
+
 	return nil
 }
 
@@ -966,6 +981,9 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
 		}
 	}
+
+	// Attach any additional databases configured via the 'attach' section
+	AttachDatabases(db, cfg.Attach)
 
 	return db, nil
 }
@@ -1027,6 +1045,40 @@ func hasCacheHTTPFS(extensions []string) bool {
 }
 
 // AttachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
+// AttachDatabases attaches all databases listed in cfg.Attach.
+// Each entry generates an ATTACH statement. Already-attached databases are skipped.
+// Errors are logged as warnings and do not fail the connection.
+func AttachDatabases(db *sql.DB, attachCfgs []AttachConfig) {
+	for _, a := range attachCfgs {
+		// Check if already attached.
+		var count int
+		err := db.QueryRow("SELECT COUNT(*) FROM duckdb_databases() WHERE database_name = ?", a.Alias).Scan(&count)
+		if err == nil && count > 0 {
+			continue
+		}
+
+		stmt := fmt.Sprintf("ATTACH '%s' AS %s", strings.ReplaceAll(a.Path, "'", "''"), a.Alias)
+		var opts []string
+		if a.DataPath != "" {
+			opts = append(opts, fmt.Sprintf("DATA_PATH '%s'", strings.ReplaceAll(a.DataPath, "'", "''")))
+		}
+		if a.OverrideDataPath {
+			opts = append(opts, "OVERRIDE_DATA_PATH TRUE")
+		}
+		if a.ReadOnly {
+			opts = append(opts, "READ_ONLY")
+		}
+		if len(opts) > 0 {
+			stmt += " (" + strings.Join(opts, ", ") + ")"
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to attach database.", "alias", a.Alias, "path", a.Path, "error", err)
+		} else {
+			slog.Info("Attached database.", "alias", a.Alias, "path", a.Path)
+		}
+	}
+}
+
 // Call setDuckLakeDefault after creating per-connection views in memory.main.
 // This is a standalone function so it can be reused by control plane workers.
 // dataDir is used for writing migration backup files if a schema upgrade is needed.

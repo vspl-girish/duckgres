@@ -48,6 +48,7 @@ type FileConfig struct {
 	PassthroughUsers          []string            `yaml:"passthrough_users"`      // Users that bypass transpiler + pg_catalog
 	LogLevel                  string              `yaml:"log_level"`              // Log level: debug, info, warn, error
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
+	Attach                    []AttachFileConfig  `yaml:"attach"`                 // Additional DuckDB databases to attach on connection
 
 	// Worker backend configuration
 	WorkerBackend string        `yaml:"worker_backend"` // "process" (default) or "remote" for config-store-backed K8s multitenant mode
@@ -129,6 +130,23 @@ type DuckLakeFileConfig struct {
 	// DataInliningRowLimit controls max rows inlined in metadata per insert.
 	// Default: 0 (disabled). Set to a positive value to enable inlining.
 	DataInliningRowLimit *int `yaml:"data_inlining_row_limit"`
+}
+
+// AttachFileConfig represents a single DuckDB ATTACH entry in config.yaml.
+type AttachFileConfig struct {
+	// Path is the database file path or connection string (required).
+	// Examples: "./analytics.db", "/data/warehouse.duckdb"
+	Path string `yaml:"path"`
+	// Alias is the name to use when referencing this database (required).
+	// Example: ATTACH './analytics.db' AS analytics
+	Alias string `yaml:"alias"`
+	// ReadOnly attaches the database in read-only mode (optional, default: false).
+	ReadOnly bool `yaml:"read_only"`
+	// DataPath sets the DATA_PATH option on the ATTACH statement (optional).
+	// Examples: "s3://bucket/path/", "/local/data"
+	DataPath string `yaml:"data_path"`
+	// OverrideDataPath sets OVERRIDE_DATA_PATH TRUE on the ATTACH statement (optional).
+	OverrideDataPath bool `yaml:"override_data_path"`
 }
 
 // loadConfigFile loads configuration from a YAML file

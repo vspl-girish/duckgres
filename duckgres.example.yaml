@@ -32,6 +32,19 @@ users:
 # passthrough_users:
 #   - alice
 
+# Additional DuckDB databases to attach on every new connection (optional)
+# Each entry generates: ATTACH 'path' AS alias [(DATA_PATH '...', READ_ONLY)]
+# attach:
+#   - path: "./analytics.db"
+#     alias: analytics
+#   - path: "/data/warehouse.duckdb"
+#     alias: warehouse
+#     read_only: true
+#   - path: "ducklake:postgres:host=localhost dbname=other"
+#     alias: other
+#     data_path: "s3://bucket/other/"
+#     override_data_path: true
+
 # DuckDB extensions to load on database initialization
 # Extensions are installed (downloaded if needed) and loaded automatically
 # Common extensions: httpfs, parquet, json, sqlite, postgres, mysql, excel
