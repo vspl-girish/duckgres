@@ -49,6 +49,11 @@ type FileConfig struct {
 	LogLevel                  string              `yaml:"log_level"`              // Log level: debug, info, warn, error
 	QueryLog                  QueryLogFileConfig  `yaml:"query_log"`              // Query log configuration
 	Attach                    []AttachFileConfig  `yaml:"attach"`                 // Additional DuckDB databases to attach on connection
+	Secrets                   []string            `yaml:"secrets"`                // Raw DuckDB CREATE SECRET statements executed on each connection
+	DefaultCatalog            string              `yaml:"default_catalog"`        // Catalog to set as default (USE <catalog>) on each connection
+	MetricsPort               int                 `yaml:"metrics_port"`           // Port for Prometheus /metrics endpoint (default: 9090, 0 disables)
+	RemapFunctions            []string            `yaml:"remap-functions"`        // Function names to remap: default_catalog.fn() -> memory.main.fn()
+	PostInitScript            string              `yaml:"post_init_script"`       // Path to a SQL file executed on every new connection after all init steps
 
 	// Worker backend configuration
 	WorkerBackend string        `yaml:"worker_backend"` // "process" (default) or "remote" for config-store-backed K8s multitenant mode
@@ -170,13 +175,17 @@ func env(key, defaultVal string) string {
 	return defaultVal
 }
 
-// initMetrics starts the Prometheus metrics HTTP server on :9090/metrics.
+// initMetrics starts the Prometheus metrics HTTP server on :<port>/metrics.
+// Returns nil if port is 0 (disabled).
 // Returns the http.Server instance so it can be shut down during handover.
-func initMetrics() *http.Server {
+func initMetrics(port int) *http.Server {
+	if port == 0 {
+		return nil
+	}
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
 	srv := &http.Server{
-		Addr:    ":9090",
+		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
 	}
 	go func() {
@@ -532,7 +541,7 @@ func main() {
 		return
 	}
 
-	metricsSrv := initMetrics()
+	metricsSrv := initMetrics(cfg.MetricsPort)
 
 	// Create data directory if it doesn't exist
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {

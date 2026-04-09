@@ -5,6 +5,10 @@
 host: "0.0.0.0"
 port: 5432
 
+# Prometheus metrics endpoint (optional)
+# Default: 9090. Set to 0 to disable.
+# metrics_port: 9090
+
 # Control-plane Arrow Flight SQL ingress (optional)
 # 0 or omitted disables Flight ingress.
 # flight_port: 8815
@@ -31,6 +35,12 @@ users:
 # Queries are sent directly to DuckDB. Users listed here must also exist in 'users' above.
 # passthrough_users:
 #   - alice
+
+# Default catalog to use on every connection (optional)
+# Executes USE <catalog> after connection setup.
+# When ducklake is configured, defaults to "ducklake" automatically.
+# Override to use a different attached database as the default.
+# default_catalog: analytics
 
 # Additional DuckDB databases to attach on every new connection (optional)
 # Each entry generates: ATTACH 'path' AS alias [(DATA_PATH '...', READ_ONLY)]
@@ -90,6 +100,34 @@ ducklake:
   # s3_chain: "env;config"             # Which sources to check (env, config, sts, sso, instance, process)
   # s3_profile: "my-profile"           # AWS profile name (for config chain)
   # s3_region: "us-west-2"             # Override auto-detected region
+
+# DuckDB secrets executed on every new connection (optional)
+# Use this to configure storage credentials via raw DuckDB CREATE SECRET statements.
+# See: https://duckdb.org/docs/stable/sql/statements/create_secret
+# secrets:
+#   # Google Cloud Storage with HMAC keys
+#   - "CREATE SECRET (TYPE GCS, KEY_ID 'GOOG1...', SECRET 'secret-pass')"
+#   # Google Cloud Storage with Application Default Credentials
+#   - "CREATE SECRET (TYPE GCS, PROVIDER credential_chain)"
+#   # AWS S3 with explicit credentials
+#   - "CREATE SECRET (TYPE S3, KEY_ID 'AKID...', SECRET 'secret', REGION 'us-east-1')"
+#   # Azure Blob Storage
+#   - "CREATE SECRET (TYPE AZURE, CONNECTION_STRING 'DefaultEndpointsProtocol=https;...')"
+
+# Post-init SQL script (optional)
+# Path to a SQL file executed on every new connection after all other initialization
+# steps (pg_catalog, extensions, DuckLake, attach, secrets, etc.).
+# Statements are split on semicolons. Errors are logged but do not fail the connection.
+# post_init_script: /etc/duckgres/post-init.sql
+
+# Function remapping (optional)
+# Functions listed here are re-exposed in the default_catalog so clients that
+# qualify calls with that catalog still resolve to the memory.main implementation.
+# Each entry generates:
+#   CREATE OR REPLACE FUNCTION <default_catalog>.<name>() AS (memory.main.<name>())
+# remap-functions:
+#   - my_udf
+#   - another_func
 
 # DuckDB resource limits per session (standalone mode)
 # Auto-detected from system memory if not set.

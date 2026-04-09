@@ -193,6 +193,25 @@ type Config struct {
 
 	// Attach lists additional DuckDB databases to attach on every new connection.
 	Attach []AttachConfig
+
+	// Secrets holds raw DuckDB CREATE SECRET statements executed on every new connection.
+	Secrets []string
+
+	// RemapFunctions holds function names that should be remapped on every new connection.
+	// For each name, executes: CREATE OR REPLACE FUNCTION default_catalog.name() AS (memory.main.name())
+	RemapFunctions []string
+
+	// DefaultCatalog is the catalog name to set as default via USE <catalog> on every connection.
+	// When DuckLake is configured this is set automatically to "ducklake" unless overridden here.
+	DefaultCatalog string
+
+	// MetricsPort is the port for the Prometheus /metrics HTTP endpoint.
+	// Default: 9090. Set to 0 to disable.
+	MetricsPort int
+
+	// PostInitScript is the path to a SQL file executed on every new connection
+	// after all other initialization steps (pg_catalog, DuckLake, attach, etc.).
+	PostInitScript string
 }
 
 // QueryLogConfig configures the query log feature.
@@ -876,6 +895,10 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 	// Register ClickHouse SQL macros (chsql compat)
 	initClickHouseMacros(db)
 
+	// Execute user-defined secrets (e.g. CREATE SECRET for GCS, S3, etc.)
+	// Must run before DuckLake attach so secrets are available for object store access.
+	ExecSecrets(db, cfg.Secrets)
+
 	// Attach DuckLake catalog if configured (but don't set as default yet)
 	duckLakeMode := false
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
@@ -912,15 +935,31 @@ func ConfigureDBConnection(db *sql.DB, cfg Config, duckLakeSem chan struct{}, us
 		// Continue anyway - basic queries will still work
 	}
 
-	// Now set DuckLake as the default catalog so all user queries use it
-	if duckLakeMode {
-		if err := setDuckLakeDefault(db); err != nil {
-			return fmt.Errorf("failed to set DuckLake as default: %w", err)
-		}
-	}
-
 	// Attach any additional databases configured via the 'attach' section
 	AttachDatabases(db, cfg.Attach)
+
+	// Set the default catalog after all databases are attached.
+	// Explicit config overrides the DuckLake default.
+	defaultCatalog := cfg.DefaultCatalog
+	if defaultCatalog == "" && duckLakeMode {
+		defaultCatalog = "ducklake"
+	}
+	if defaultCatalog != "" {
+		if _, err := db.Exec("USE " + defaultCatalog); err != nil {
+			return fmt.Errorf("failed to set default catalog %q: %w", defaultCatalog, err)
+		}
+		slog.Info("Set default catalog.", "catalog", defaultCatalog)
+	}
+
+	// Remap functions into the default catalog after all catalogs are attached.
+	if len(cfg.RemapFunctions) > 0 && defaultCatalog != "" {
+		ExecRemapFunctions(db, cfg.RemapFunctions, defaultCatalog)
+	}
+
+	// Execute post-init SQL script as the final initialization step.
+	if cfg.PostInitScript != "" {
+		ExecPostInitScript(db, cfg.PostInitScript)
+	}
 
 	return nil
 }
@@ -968,6 +1007,9 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 	// Register ClickHouse SQL macros (chsql compat)
 	initClickHouseMacros(db)
 
+	// Execute user-defined secrets before DuckLake attach
+	ExecSecrets(db, cfg.Secrets)
+
 	// Attach DuckLake catalog if configured (same data, no pg_catalog views)
 	if err := AttachDuckLake(db, cfg.DuckLake, duckLakeSem, cfg.DataDir); err != nil {
 		if cfg.DuckLake.MetadataStore != "" {
@@ -975,15 +1017,26 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 			return nil, fmt.Errorf("DuckLake configured but attachment failed: %w", err)
 		}
 		slog.Warn("Failed to attach DuckLake.", "user", username, "error", err)
-	} else if cfg.DuckLake.MetadataStore != "" {
-		if err := setDuckLakeDefault(db); err != nil {
-			_ = db.Close()
-			return nil, fmt.Errorf("failed to set DuckLake as default: %w", err)
-		}
 	}
 
 	// Attach any additional databases configured via the 'attach' section
 	AttachDatabases(db, cfg.Attach)
+
+	defaultCatalog := cfg.DefaultCatalog
+	if defaultCatalog == "" && cfg.DuckLake.MetadataStore != "" {
+		defaultCatalog = "ducklake"
+	}
+	if defaultCatalog != "" {
+		if _, err := db.Exec("USE " + defaultCatalog); err != nil {
+			_ = db.Close()
+			return nil, fmt.Errorf("failed to set default catalog %q: %w", defaultCatalog, err)
+		}
+	}
+
+	// Remap functions into the default catalog after all catalogs are attached.
+	if len(cfg.RemapFunctions) > 0 && defaultCatalog != "" {
+		ExecRemapFunctions(db, cfg.RemapFunctions, defaultCatalog)
+	}
 
 	return db, nil
 }
@@ -1045,6 +1098,53 @@ func hasCacheHTTPFS(extensions []string) bool {
 }
 
 // AttachDuckLake attaches a DuckLake catalog if configured (but does NOT set it as default).
+// ExecRemapFunctions creates forwarding functions in the configured default catalog
+// that delegate to the memory.main implementation. For each name in fns, executes:
+//
+//	CREATE OR REPLACE FUNCTION <defaultCatalog>.<name>() AS (memory.main.<name>())
+//
+// Errors are logged as warnings and do not fail the connection.
+func ExecRemapFunctions(db *sql.DB, fns []string, defaultCatalog string) {
+	for _, name := range fns {
+		stmt := fmt.Sprintf(
+			"CREATE OR REPLACE FUNCTION %s.%s() AS (memory.main.%s())",
+			defaultCatalog, name, name,
+		)
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to remap function.", "function", name, "error", err)
+		}
+	}
+}
+
+// ExecPostInitScript reads a SQL file and executes each semicolon-delimited statement.
+// Errors are logged as warnings and do not fail the connection.
+func ExecPostInitScript(db *sql.DB, path string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		slog.Warn("Failed to read post-init script.", "path", path, "error", err)
+		return
+	}
+	for _, stmt := range strings.Split(string(data), ";") {
+		stmt = strings.TrimSpace(stmt)
+		if stmt == "" {
+			continue
+		}
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to execute post-init script statement.", "path", path, "stmt", stmt, "error", err)
+		}
+	}
+}
+
+// ExecSecrets executes raw DuckDB CREATE SECRET statements from cfg.Secrets.
+// Errors are logged as warnings and do not fail the connection.
+func ExecSecrets(db *sql.DB, secrets []string) {
+	for _, stmt := range secrets {
+		if _, err := db.Exec(stmt); err != nil {
+			slog.Warn("Failed to execute secret statement.", "error", err)
+		}
+	}
+}
+
 // AttachDatabases attaches all databases listed in cfg.Attach.
 // Each entry generates an ATTACH statement. Already-attached databases are skipped.
 // Errors are logged as warnings and do not fail the connection.
@@ -1296,7 +1396,7 @@ func setDuckLakeDefault(db *sql.DB) error {
 
 // createS3Secret creates a DuckDB secret for S3/MinIO access.
 // This is a standalone function so it can be reused by control plane workers.
-// Supports three providers:
+// S3 supports three providers:
 //   - "config": explicit credentials (for MinIO or when you have access keys)
 //   - "credential_chain": DuckDB's built-in credential chain (does NOT support EKS Pod Identity)
 //   - "aws_sdk": Go AWS SDK credential fetch → explicit config secret (supports EKS Pod Identity)

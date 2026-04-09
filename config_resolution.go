@@ -122,6 +122,7 @@ func defaultServerConfig() server.Config {
 			CompactInterval:      10 * time.Minute,
 			DataInliningRowLimit: 1000,
 		},
+		MetricsPort: 9090,
 	}
 }
 
@@ -336,6 +337,22 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 			for _, u := range fileCfg.PassthroughUsers {
 				cfg.PassthroughUsers[u] = true
 			}
+		}
+
+		if len(fileCfg.Secrets) > 0 {
+			cfg.Secrets = fileCfg.Secrets
+		}
+		if len(fileCfg.RemapFunctions) > 0 {
+			cfg.RemapFunctions = fileCfg.RemapFunctions
+		}
+		if fileCfg.PostInitScript != "" {
+			cfg.PostInitScript = fileCfg.PostInitScript
+		}
+		if fileCfg.DefaultCatalog != "" {
+			cfg.DefaultCatalog = fileCfg.DefaultCatalog
+		}
+		if fileCfg.MetricsPort != 0 {
+			cfg.MetricsPort = fileCfg.MetricsPort
 		}
 
 		if len(fileCfg.Attach) > 0 {
