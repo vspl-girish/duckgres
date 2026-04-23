@@ -35,6 +35,7 @@ type FileConfig struct {
 	RateLimit                 RateLimitFileConfig `yaml:"rate_limit"`
 	Extensions                []string            `yaml:"extensions"`
 	DuckLake                  DuckLakeFileConfig  `yaml:"ducklake"`
+	FilePersistence           bool                `yaml:"file_persistence"`  // Persist DuckDB to <data_dir>/<username>.duckdb instead of :memory:
 	ProcessIsolation          bool                `yaml:"process_isolation"` // Enable process isolation per connection
 	IdleTimeout               string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 	MemoryLimit               string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
@@ -62,8 +63,9 @@ type FileConfig struct {
 }
 
 type ProcessFileConfig struct {
-	MinWorkers int `yaml:"min_workers"`
-	MaxWorkers int `yaml:"max_workers"`
+	MinWorkers         int   `yaml:"min_workers"`
+	MaxWorkers         int   `yaml:"max_workers"`
+	RetireOnSessionEnd *bool `yaml:"retire_on_session_end"`
 }
 
 // K8sFileConfig holds Kubernetes worker configuration from YAML.
@@ -114,6 +116,10 @@ type DuckLakeFileConfig struct {
 	MetadataStore string `yaml:"metadata_store"` // e.g., "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
 	ObjectStore   string `yaml:"object_store"`   // e.g., "s3://bucket/path/" for S3/MinIO storage
 	DataPath      string `yaml:"data_path"`      // Local file path for data storage (alternative to object_store)
+
+	// Disable metadata postgres_scanner thread-local cache before ATTACH creates
+	// the hidden metadata pool. Nil means use the server default.
+	DisableMetadataThreadLocalCache *bool `yaml:"disable_metadata_thread_local_cache"`
 
 	// S3 credential provider: "config" (explicit) or "credential_chain" (AWS SDK)
 	S3Provider string `yaml:"s3_provider"`
@@ -215,9 +221,12 @@ func main() {
 
 	// Check if we're running as a child worker process
 	if os.Getenv("DUCKGRES_CHILD_MODE") == "1" {
-		// Use the same logging setup as parent for consistent log format
+		// Use the same logging/tracing setup as parent for consistent format
 		loggingShutdown := initLogging()
 		defer loggingShutdown()
+		tracingShutdown := initTracing()
+		defer tracingShutdown()
+		duckdbservice.LogCacheProxyStatus()
 		server.RunChildMode()
 		return // RunChildMode calls os.Exit
 	}
@@ -234,6 +243,7 @@ func main() {
 	dataDir := flag.String("data-dir", "", "Directory for DuckDB files (env: DUCKGRES_DATA_DIR)")
 	certFile := flag.String("cert", "", "TLS certificate file (env: DUCKGRES_CERT)")
 	keyFile := flag.String("key", "", "TLS private key file (env: DUCKGRES_KEY)")
+	filePersistence := flag.Bool("file-persistence", false, "Persist DuckDB to <data-dir>/<username>.duckdb instead of in-memory (env: DUCKGRES_FILE_PERSISTENCE)")
 	processIsolation := flag.Bool("process-isolation", false, "Enable process isolation (spawn child process per connection)")
 	idleTimeout := flag.String("idle-timeout", "", "Connection idle timeout (e.g., '30m', '1h', '-1' to disable) (env: DUCKGRES_IDLE_TIMEOUT)")
 	memoryLimit := flag.String("memory-limit", "", "DuckDB memory_limit per session (e.g., '4GB') (env: DUCKGRES_MEMORY_LIMIT)")
@@ -253,6 +263,7 @@ func main() {
 	mode := flag.String("mode", "standalone", "Run mode: standalone, control-plane, or duckdb-service")
 	processMinWorkers := flag.Int("process-min-workers", 0, "Pre-warm worker count at startup for process workers (control-plane mode) (env: DUCKGRES_PROCESS_MIN_WORKERS)")
 	processMaxWorkers := flag.Int("process-max-workers", 0, "Max process workers, 0=auto-derived (control-plane mode) (env: DUCKGRES_PROCESS_MAX_WORKERS)")
+	processRetireOnSessionEnd := flag.Bool("process-retire-on-session-end", false, "Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode) (env: DUCKGRES_PROCESS_RETIRE_ON_SESSION_END)")
 	workerQueueTimeout := flag.String("worker-queue-timeout", "", "How long to wait for an available worker slot (e.g., '5m') (env: DUCKGRES_WORKER_QUEUE_TIMEOUT)")
 	workerIdleTimeout := flag.String("worker-idle-timeout", "", "How long to keep an idle worker alive (e.g., '5m') (env: DUCKGRES_WORKER_IDLE_TIMEOUT)")
 	handoverDrainTimeout := flag.String("handover-drain-timeout", "", "How long to wait for planned shutdowns/upgrades to drain before forcing exit (default: '24h' in process mode, '15m' in remote mode) (env: DUCKGRES_HANDOVER_DRAIN_TIMEOUT)")
@@ -308,6 +319,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_DATA_DIR           Directory for DuckDB files (default: ./data)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_CERT               TLS certificate file (default: ./certs/server.crt)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_KEY                TLS private key file (default: ./certs/server.key)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_FILE_PERSISTENCE   Persist DuckDB to <data_dir>/<username>.duckdb (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_ISOLATION  Enable process isolation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_IDLE_TIMEOUT       Connection idle timeout (e.g., 30m, 1h, -1 to disable)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_LIMIT       DuckDB memory_limit per session (e.g., 4GB)\n")
@@ -316,6 +328,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_MEMORY_REBALANCE   Enable dynamic per-connection memory reallocation (1 or true)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_MIN_WORKERS  Pre-warm worker count for process workers (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_MAX_WORKERS  Max process workers (control-plane mode)\n")
+		fmt.Fprintf(os.Stderr, "  DUCKGRES_PROCESS_RETIRE_ON_SESSION_END  Retire process workers immediately after their last session ends (control-plane mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_WORKER_QUEUE_TIMEOUT  Worker queue timeout (default: 5m)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_HANDOVER_DRAIN_TIMEOUT  Planned shutdown/upgrade drain timeout (default: 24h in process mode, 15m in remote mode)\n")
 		fmt.Fprintf(os.Stderr, "  DUCKGRES_ACME_DOMAIN        Domain for ACME/Let's Encrypt certificate\n")
@@ -387,6 +400,12 @@ func main() {
 	loggingShutdown := initLogging()
 	defer loggingShutdown()
 
+	tracingShutdown := initTracing()
+	defer tracingShutdown()
+
+	logBuildInfo(*mode)
+	duckdbservice.LogCacheProxyStatus()
+
 	if fileCfg != nil {
 		slog.Info("Loaded configuration from " + *configFile)
 	}
@@ -414,6 +433,7 @@ func main() {
 		DataDir:                   *dataDir,
 		CertFile:                  *certFile,
 		KeyFile:                   *keyFile,
+		FilePersistence:           *filePersistence,
 		ProcessIsolation:          *processIsolation,
 		IdleTimeout:               *idleTimeout,
 		MemoryLimit:               *memoryLimit,
@@ -422,6 +442,7 @@ func main() {
 		MemoryRebalance:           *memoryRebalance,
 		ProcessMinWorkers:         *processMinWorkers,
 		ProcessMaxWorkers:         *processMaxWorkers,
+		ProcessRetireOnSessionEnd: *processRetireOnSessionEnd,
 		WorkerQueueTimeout:        *workerQueueTimeout,
 		WorkerIdleTimeout:         *workerIdleTimeout,
 		HandoverDrainTimeout:      *handoverDrainTimeout,
@@ -573,6 +594,7 @@ func main() {
 			ConfigPath:           *configFile,
 			WorkerQueueTimeout:   resolved.WorkerQueueTimeout,
 			WorkerIdleTimeout:    resolved.WorkerIdleTimeout,
+			RetireOnSessionEnd:   resolved.ProcessRetireOnSessionEnd,
 			HandoverDrainTimeout: resolved.HandoverDrainTimeout,
 			MetricsServer:        metricsSrv,
 			WorkerBackend:        resolved.WorkerBackend,
@@ -580,23 +602,23 @@ func main() {
 			ConfigPollInterval:   resolved.ConfigPollInterval,
 			InternalSecret:       resolved.InternalSecret,
 			K8s: controlplane.K8sConfig{
-				WorkerImage:       resolved.K8sWorkerImage,
-				WorkerNamespace:   resolved.K8sWorkerNamespace,
-				ControlPlaneID:    resolved.K8sControlPlaneID,
-				WorkerPort:        resolved.K8sWorkerPort,
-				WorkerSecret:      resolved.K8sWorkerSecret,
-				WorkerConfigMap:   resolved.K8sWorkerConfigMap,
-				ImagePullPolicy:   resolved.K8sWorkerImagePullPolicy,
-				ServiceAccount:    resolved.K8sWorkerServiceAccount,
-				MaxWorkers:        resolved.K8sMaxWorkers,
-				SharedWarmTarget:    resolved.K8sSharedWarmTarget,
-				WorkerCPURequest:    resolved.K8sWorkerCPURequest,
-				WorkerMemoryRequest: resolved.K8sWorkerMemoryRequest,
-				WorkerNodeSelector:  resolved.K8sWorkerNodeSelector,
+				WorkerImage:           resolved.K8sWorkerImage,
+				WorkerNamespace:       resolved.K8sWorkerNamespace,
+				ControlPlaneID:        resolved.K8sControlPlaneID,
+				WorkerPort:            resolved.K8sWorkerPort,
+				WorkerSecret:          resolved.K8sWorkerSecret,
+				WorkerConfigMap:       resolved.K8sWorkerConfigMap,
+				ImagePullPolicy:       resolved.K8sWorkerImagePullPolicy,
+				ServiceAccount:        resolved.K8sWorkerServiceAccount,
+				MaxWorkers:            resolved.K8sMaxWorkers,
+				SharedWarmTarget:      resolved.K8sSharedWarmTarget,
+				WorkerCPURequest:      resolved.K8sWorkerCPURequest,
+				WorkerMemoryRequest:   resolved.K8sWorkerMemoryRequest,
+				WorkerNodeSelector:    resolved.K8sWorkerNodeSelector,
 				WorkerTolerationKey:   resolved.K8sWorkerTolerationKey,
 				WorkerTolerationValue: resolved.K8sWorkerTolerationValue,
-				WorkerExclusiveNode:  resolved.K8sWorkerExclusiveNode,
-				AWSRegion:           resolved.AWSRegion,
+				WorkerExclusiveNode:   resolved.K8sWorkerExclusiveNode,
+				AWSRegion:             resolved.AWSRegion,
 			},
 		}
 		controlplane.RunControlPlane(cpCfg)

@@ -166,6 +166,15 @@ extensions:
 
 ducklake:
   metadata_store: "postgres:host=localhost user=ducklake password=secret dbname=ducklake"
+  # Default: true. Disables postgres_scanner thread-local caching for the
+  # hidden DuckLake metadata pool to reduce retained metadata connections.
+  # Set to false to opt back into warm connection reuse.
+  disable_metadata_thread_local_cache: true
+
+process:
+  min_workers: 0
+  max_workers: 0
+  retire_on_session_end: false
 
 rate_limit:
   max_failed_attempts: 5
@@ -198,6 +207,7 @@ Run with config file:
 | `DUCKGRES_MEMORY_LIMIT` | DuckDB memory_limit per session (e.g., `4GB`) | Auto-detected |
 | `DUCKGRES_THREADS` | DuckDB threads per session | `runtime.NumCPU()` |
 | `DUCKGRES_PROCESS_ISOLATION` | Enable process isolation (`1` or `true`) | `false` |
+| `DUCKGRES_PROCESS_RETIRE_ON_SESSION_END` | Retire a process worker immediately after its last session ends instead of keeping it warm for reuse | `false` |
 | `DUCKGRES_IDLE_TIMEOUT` | Connection idle timeout (e.g., `30m`, `1h`, `-1` to disable) | `24h` |
 | `DUCKGRES_HANDOVER_DRAIN_TIMEOUT` | Max time to drain planned shutdowns and upgrades before forcing exit | `24h` in process mode, `15m` in remote K8s mode |
 | `DUCKGRES_K8S_SHARED_WARM_TARGET` | Neutral shared warm-worker target for K8s multi-tenant mode (`0` disables prewarm) | `0` |
@@ -250,6 +260,8 @@ Options:
   -mode string             Run mode: standalone (default), control-plane, or duckdb-service
   -process-min-workers int Pre-warm process worker count at startup (control-plane mode, default 0)
   -process-max-workers int Max process workers, 0=auto-derived (control-plane mode)
+  -process-retire-on-session-end
+                          Retire a process worker immediately after its last session ends instead of keeping it warm for reuse (control-plane mode)
   -memory-budget string    Total memory for all DuckDB sessions (e.g., '24GB')
   -socket-dir string       Unix socket directory (control-plane mode)
   -handover-socket string  Handover socket for graceful deployment (control-plane mode)
@@ -276,6 +288,11 @@ DuckLake provides a SQL-based lakehouse format. When configured, the DuckLake ca
 ducklake:
   # Full connection string for the DuckLake metadata database
   metadata_store: "postgres:host=ducklake.example.com user=ducklake password=secret dbname=ducklake"
+
+  # Default: true. Disables postgres_scanner thread-local caching for the
+  # hidden DuckLake metadata pool before ATTACH creates it.
+  # Set to false to opt back into warm connection reuse.
+  disable_metadata_thread_local_cache: true
 ```
 
 This runs the equivalent of:
@@ -284,6 +301,12 @@ ATTACH 'ducklake:postgres:host=ducklake.example.com user=ducklake password=secre
 ```
 
 See [DuckLake documentation](https://ducklake.select/docs/stable/duckdb/usage/connecting) for more details.
+
+`ducklake.disable_metadata_thread_local_cache` defaults to `true`. This applies a
+pre-attach workaround for the hidden DuckLake metadata postgres pool so idle
+worker threads do not retain metadata connections indefinitely. Set it to
+`false` only if you explicitly want the older warm-reuse behavior and accept the
+larger steady-state metadata connection footprint.
 
 ### Quick Start with Docker
 
@@ -498,7 +521,7 @@ GROUP BY name;
 
 ## Architecture
 
-Duckgres supports two run modes: **standalone** (single process, default) and **control-plane** (multi-process with worker pool).
+Duckgres supports three run modes: **standalone** (single process, default), **control-plane** (multi-process with worker pool), and **duckdb-service** (worker process mode used by the control plane).
 
 ### Standalone Mode
 

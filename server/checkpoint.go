@@ -59,11 +59,18 @@ func NewDuckLakeCheckpointer(cfg Config) (*DuckLakeCheckpointer, error) {
 		}
 	}
 
+	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("checkpoint: pre-attach settings: %w", err)
+	}
+
 	attachStmt := buildDuckLakeAttachStmt(dlCfg, duckLakeMigrationNeeded())
 	if _, err := db.Exec(attachStmt); err != nil {
 		_ = db.Close()
 		return nil, fmt.Errorf("checkpoint: attach ducklake: %w", err)
 	}
+
+	configureDuckLakeMetadataPool(db)
 
 	// Create system.checkpoints table to record checkpoint history
 	if _, err := db.Exec("CREATE SCHEMA IF NOT EXISTS ducklake.system"); err != nil {

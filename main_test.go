@@ -111,18 +111,21 @@ func TestResolveEffectiveConfigEnvOverridesFile(t *testing.T) {
 }
 
 func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
+	enabled := true
 	fileCfg := &FileConfig{
 		ProcessIsolation: true,
 		IdleTimeout:      "45m",
 		DuckLake: DuckLakeFileConfig{
-			S3UseSSL: true,
+			S3UseSSL:                        true,
+			DisableMetadataThreadLocalCache: &enabled,
 		},
 	}
 
 	env := map[string]string{
-		"DUCKGRES_PROCESS_ISOLATION":   "not-a-bool",
-		"DUCKGRES_DUCKLAKE_S3_USE_SSL": "not-a-bool",
-		"DUCKGRES_IDLE_TIMEOUT":        "bad-duration",
+		"DUCKGRES_PROCESS_ISOLATION":                            "not-a-bool",
+		"DUCKGRES_DUCKLAKE_S3_USE_SSL":                          "not-a-bool",
+		"DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE": "not-a-bool",
+		"DUCKGRES_IDLE_TIMEOUT":                                 "bad-duration",
 	}
 
 	var warns []string
@@ -136,6 +139,9 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	if !resolved.Server.DuckLake.S3UseSSL {
 		t.Fatalf("invalid env S3_USE_SSL should not override valid file value")
 	}
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+		t.Fatalf("invalid env disable_metadata_thread_local_cache should not override valid file value")
+	}
 	if resolved.Server.IdleTimeout != 45*time.Minute {
 		t.Fatalf("invalid env idle timeout should not override valid file value, got %s", resolved.Server.IdleTimeout)
 	}
@@ -143,6 +149,7 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 	wantWarnings := []string{
 		"Invalid DUCKGRES_PROCESS_ISOLATION",
 		"Invalid DUCKGRES_DUCKLAKE_S3_USE_SSL",
+		"Invalid DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE",
 		"Invalid DUCKGRES_IDLE_TIMEOUT duration",
 	}
 	for _, w := range wantWarnings {
@@ -156,6 +163,51 @@ func TestResolveEffectiveConfigInvalidEnvValues(t *testing.T) {
 		if !found {
 			t.Fatalf("expected warning containing %q, warnings: %v", w, warns)
 		}
+	}
+}
+
+func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCache(t *testing.T) {
+	enabled := true
+	fileCfg := &FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			DisableMetadataThreadLocalCache: &enabled,
+		},
+	}
+
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+		t.Fatal("expected ducklake.disable_metadata_thread_local_cache from YAML to be true")
+	}
+
+	env := map[string]string{
+		"DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE": "false",
+	}
+	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || *resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+		t.Fatal("expected env false to override file true for ducklake.disable_metadata_thread_local_cache")
+	}
+
+	env["DUCKGRES_DUCKLAKE_DISABLE_METADATA_THREAD_LOCAL_CACHE"] = "true"
+	resolved = resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+		t.Fatal("expected env true to enable ducklake.disable_metadata_thread_local_cache")
+	}
+}
+
+func TestResolveEffectiveConfigDuckLakeDisableMetadataThreadLocalCacheDefaultsTrue(t *testing.T) {
+	resolved := resolveEffectiveConfig(&FileConfig{}, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || !*resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+		t.Fatal("expected ducklake.disable_metadata_thread_local_cache to default to true")
+	}
+
+	disabled := false
+	resolved = resolveEffectiveConfig(&FileConfig{
+		DuckLake: DuckLakeFileConfig{
+			DisableMetadataThreadLocalCache: &disabled,
+		},
+	}, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.DuckLake.DisableMetadataThreadLocalCache == nil || *resolved.Server.DuckLake.DisableMetadataThreadLocalCache {
+		t.Fatal("expected YAML false to disable ducklake.disable_metadata_thread_local_cache")
 	}
 }
 
@@ -321,12 +373,14 @@ func TestResolveEffectiveConfigInvalidMemoryLimit(t *testing.T) {
 }
 
 func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
+	retireTrue := true
 	// YAML only
 	fileCfg := &FileConfig{
 		MemoryBudget: "24GB",
 		Process: ProcessFileConfig{
-			MinWorkers: 2,
-			MaxWorkers: 10,
+			MinWorkers:         2,
+			MaxWorkers:         10,
+			RetireOnSessionEnd: &retireTrue,
 		},
 		K8s: K8sFileConfig{
 			MaxWorkers: 12,
@@ -342,16 +396,20 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	if resolved.ProcessMaxWorkers != 10 {
 		t.Fatalf("expected process.max_workers from file, got %d", resolved.ProcessMaxWorkers)
 	}
+	if !resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected process.retire_on_session_end from file")
+	}
 	if resolved.K8sMaxWorkers != 12 {
 		t.Fatalf("expected k8s.max_workers from file, got %d", resolved.K8sMaxWorkers)
 	}
 
 	// Env overrides file
 	env := map[string]string{
-		"DUCKGRES_MEMORY_BUDGET":       "32GB",
-		"DUCKGRES_PROCESS_MIN_WORKERS": "4",
-		"DUCKGRES_PROCESS_MAX_WORKERS": "20",
-		"DUCKGRES_K8S_MAX_WORKERS":     "24",
+		"DUCKGRES_MEMORY_BUDGET":                 "32GB",
+		"DUCKGRES_PROCESS_MIN_WORKERS":           "4",
+		"DUCKGRES_PROCESS_MAX_WORKERS":           "20",
+		"DUCKGRES_PROCESS_RETIRE_ON_SESSION_END": "false",
+		"DUCKGRES_K8S_MAX_WORKERS":               "24",
 	}
 	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
 	if resolved.Server.MemoryBudget != "32GB" {
@@ -363,17 +421,21 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	if resolved.ProcessMaxWorkers != 20 {
 		t.Fatalf("expected process.max_workers from env, got %d", resolved.ProcessMaxWorkers)
 	}
+	if resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected process.retire_on_session_end from env")
+	}
 	if resolved.K8sMaxWorkers != 24 {
 		t.Fatalf("expected k8s.max_workers from env, got %d", resolved.K8sMaxWorkers)
 	}
 
 	// CLI overrides env
 	resolved = resolveEffectiveConfig(fileCfg, configCLIInputs{
-		Set:               map[string]bool{"memory-budget": true, "process-min-workers": true, "process-max-workers": true, "k8s-max-workers": true},
-		MemoryBudget:      "48GB",
-		ProcessMinWorkers: 8,
-		ProcessMaxWorkers: 50,
-		K8sMaxWorkers:     64,
+		Set:                       map[string]bool{"memory-budget": true, "process-min-workers": true, "process-max-workers": true, "process-retire-on-session-end": true, "k8s-max-workers": true},
+		MemoryBudget:              "48GB",
+		ProcessMinWorkers:         8,
+		ProcessMaxWorkers:         50,
+		ProcessRetireOnSessionEnd: true,
+		K8sMaxWorkers:             64,
 	}, envFromMap(env), nil)
 	if resolved.Server.MemoryBudget != "48GB" {
 		t.Fatalf("expected memory_budget from CLI, got %q", resolved.Server.MemoryBudget)
@@ -383,6 +445,9 @@ func TestResolveEffectiveConfigMemoryBudgetAndWorkers(t *testing.T) {
 	}
 	if resolved.ProcessMaxWorkers != 50 {
 		t.Fatalf("expected process.max_workers from CLI, got %d", resolved.ProcessMaxWorkers)
+	}
+	if !resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected process.retire_on_session_end from CLI")
 	}
 	if resolved.K8sMaxWorkers != 64 {
 		t.Fatalf("expected k8s.max_workers from CLI, got %d", resolved.K8sMaxWorkers)
@@ -446,9 +511,10 @@ func TestResolveEffectiveConfigInvalidMemoryBudget(t *testing.T) {
 
 func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	env := map[string]string{
-		"DUCKGRES_PROCESS_MIN_WORKERS": "not-a-number",
-		"DUCKGRES_PROCESS_MAX_WORKERS": "also-bad",
-		"DUCKGRES_K8S_MAX_WORKERS":     "still-bad",
+		"DUCKGRES_PROCESS_MIN_WORKERS":           "not-a-number",
+		"DUCKGRES_PROCESS_MAX_WORKERS":           "also-bad",
+		"DUCKGRES_PROCESS_RETIRE_ON_SESSION_END": "definitely-not-bool",
+		"DUCKGRES_K8S_MAX_WORKERS":               "still-bad",
 	}
 
 	var warns []string
@@ -465,10 +531,14 @@ func TestResolveEffectiveConfigInvalidWorkerEnvVars(t *testing.T) {
 	if resolved.K8sMaxWorkers != 0 {
 		t.Fatalf("expected default k8s.max_workers, got %d", resolved.K8sMaxWorkers)
 	}
+	if resolved.ProcessRetireOnSessionEnd {
+		t.Fatal("expected default process.retire_on_session_end")
+	}
 
 	wantWarnings := []string{
 		"Invalid DUCKGRES_PROCESS_MIN_WORKERS",
 		"Invalid DUCKGRES_PROCESS_MAX_WORKERS",
+		"Invalid DUCKGRES_PROCESS_RETIRE_ON_SESSION_END",
 		"Invalid DUCKGRES_K8S_MAX_WORKERS",
 	}
 	for _, w := range wantWarnings {
@@ -734,6 +804,60 @@ func TestResolveEffectiveConfigACMEDNSProviderValidation(t *testing.T) {
 	}
 }
 
+func TestResolveEffectiveConfigFilePersistenceFromFile(t *testing.T) {
+	fileCfg := &FileConfig{
+		FilePersistence: true,
+		DataDir:         "/tmp/data",
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(nil), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence from YAML to be true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceFromEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "true",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(env), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence from env to be true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceEnvOverridesFile(t *testing.T) {
+	fileCfg := &FileConfig{
+		FilePersistence: true,
+	}
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "false",
+	}
+	resolved := resolveEffectiveConfig(fileCfg, configCLIInputs{}, envFromMap(env), nil)
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected env false to override file true")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceCLIOverridesEnv(t *testing.T) {
+	env := map[string]string{
+		"DUCKGRES_FILE_PERSISTENCE": "false",
+	}
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{
+		Set:             map[string]bool{"file-persistence": true},
+		FilePersistence: true,
+	}, envFromMap(env), nil)
+	if !resolved.Server.FilePersistence {
+		t.Fatal("expected CLI true to override env false")
+	}
+}
+
+func TestResolveEffectiveConfigFilePersistenceDefaultFalse(t *testing.T) {
+	resolved := resolveEffectiveConfig(nil, configCLIInputs{}, envFromMap(nil), nil)
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected file_persistence to default to false")
+	}
+}
+
 func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 	fileCfg := &FileConfig{
 		TLS: TLSConfig{
@@ -765,5 +889,36 @@ func TestResolveEffectiveConfigACMEDNSRequiresDomain(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("expected warning about missing ACME domain for DNS mode, warnings: %v", warns)
+	}
+}
+
+func TestFilePersistenceRequiresDataDir(t *testing.T) {
+	var warns []string
+	// Use CLI to explicitly set data-dir to empty, overriding the default.
+	resolved := resolveEffectiveConfig(
+		&FileConfig{
+			FilePersistence: true,
+		},
+		configCLIInputs{
+			Set:     map[string]bool{"data-dir": true},
+			DataDir: "",
+		},
+		nil,
+		func(msg string) { warns = append(warns, msg) },
+	)
+
+	if resolved.Server.FilePersistence {
+		t.Fatal("expected FilePersistence to be disabled when DataDir is empty")
+	}
+
+	found := false
+	for _, w := range warns {
+		if strings.Contains(w, "file_persistence is enabled but data_dir is empty") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected warning about empty data_dir, warnings: %v", warns)
 	}
 }

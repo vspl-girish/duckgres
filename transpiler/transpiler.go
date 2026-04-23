@@ -2,6 +2,7 @@ package transpiler
 
 import (
 	"log/slog"
+	"regexp"
 	"strconv"
 	"strings"
 
@@ -13,24 +14,26 @@ import (
 type TransformFlags uint32
 
 const (
-	FlagWritableCTE  TransformFlags = 1 << iota // Writable CTE rewrite
-	FlagVersion                                 // version() replacement
-	FlagPgCatalog                               // pg_catalog schema/view mappings
-	FlagInfoSchema                              // information_schema mappings
-	FlagPublicSchema                            // public -> main schema mapping
-	FlagTypeMapping                             // Type mappings (JSONB->JSON, etc.)
-	FlagTypeCast                                // Type casts (::regtype -> ::varchar)
-	FlagFunctions                               // Function mappings (array_agg->list, etc.)
-	FlagFuncAlias                               // Function alias normalization
-	FlagOperators                               // Operator mappings (regex, JSON)
-	FlagSetShow                                 // SET/SHOW command handling
-	FlagExpandArray                             // _pg_expandarray handling
-	FlagOnConflict                              // ON CONFLICT handling
-	FlagLocking                                 // FOR UPDATE/SHARE removal
-	FlagCtid                                    // ctid -> rowid mapping
-	FlagDDL                                     // DDL constraint stripping
-	FlagPlaceholder                             // $1/$2 placeholder conversion
-	flagSentinel                                // must be last — used to derive FlagAll
+	FlagWritableCTE       TransformFlags = 1 << iota // Writable CTE rewrite
+	FlagVersion                                      // version() replacement
+	FlagPgCatalog                                    // pg_catalog schema/view mappings
+	FlagInfoSchema                                   // information_schema mappings
+	FlagPublicSchema                                 // public -> main schema mapping
+	FlagLogicalCatalog                               // logical database catalog -> physical catalog mapping
+	FlagTypeMapping                                  // Type mappings (JSONB->JSON, etc.)
+	FlagTypeCast                                     // Type casts (::regtype -> ::varchar)
+	FlagFunctions                                    // Function mappings (array_agg->list, etc.)
+	FlagFuncAlias                                    // Function alias normalization
+	FlagBooleanPredicates                            // Boolean predicate normalization (= true -> IS TRUE)
+	FlagOperators                                    // Operator mappings (regex, JSON)
+	FlagSetShow                                      // SET/SHOW command handling
+	FlagExpandArray                                  // _pg_expandarray handling
+	FlagOnConflict                                   // ON CONFLICT handling
+	FlagLocking                                      // FOR UPDATE/SHARE removal
+	FlagCtid                                         // ctid -> rowid mapping
+	FlagDDL                                          // DDL constraint stripping
+	FlagPlaceholder                                  // $1/$2 placeholder conversion
+	flagSentinel                                     // must be last — used to derive FlagAll
 
 	FlagAll TransformFlags = flagSentinel - 1 // All flags set
 )
@@ -54,6 +57,8 @@ type Transpiler struct {
 	config     Config
 	transforms []taggedTransform
 }
+
+var threePartIdentPattern = regexp.MustCompile(`(?i)(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*(?:"[^"]+"|[a-z_][a-z0-9_$]*)\s*\.\s*(?:"[^"]+"|[a-z_][a-z0-9_$]*)`)
 
 // New creates a Transpiler with the given configuration.
 // It registers all transforms appropriate for the config.
@@ -81,6 +86,9 @@ func New(cfg Config) *Transpiler {
 	// 3.1 Map PostgreSQL "public" schema to DuckDB "main"
 	t.transforms = append(t.transforms, taggedTransform{FlagPublicSchema, transform.NewPublicSchemaTransform()})
 
+	// 3.2 Map logical database catalog references to the physical DuckLake catalog
+	t.transforms = append(t.transforms, taggedTransform{FlagLogicalCatalog, transform.NewLogicalCatalogTransform(cfg.LogicalDatabaseName, cfg.PhysicalCatalogName)})
+
 	// 4. Type mappings (JSONB->JSON, CHAR->TEXT, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagTypeMapping, transform.NewTypeMappingTransform()})
 
@@ -93,22 +101,25 @@ func New(cfg Config) *Transpiler {
 	// 7. Function alias normalization (current_database() -> AS current_database)
 	t.transforms = append(t.transforms, taggedTransform{FlagFuncAlias, transform.NewFuncAliasTransform()})
 
-	// 8. Operator mappings (regex operators, etc.)
+	// 8. Boolean predicate normalization for DuckLake/worker execution.
+	t.transforms = append(t.transforms, taggedTransform{FlagBooleanPredicates, transform.NewBooleanPredicateTransform()})
+
+	// 9. Operator mappings (regex operators, etc.)
 	t.transforms = append(t.transforms, taggedTransform{FlagOperators, transform.NewOperatorTransform()})
 
-	// 9. SET/SHOW command handling
+	// 10. SET/SHOW command handling
 	t.transforms = append(t.transforms, taggedTransform{FlagSetShow, transform.NewSetShowTransform()})
 
-	// 10. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
+	// 11. _pg_expandarray handling (PostgreSQL array expansion function used by JDBC)
 	t.transforms = append(t.transforms, taggedTransform{FlagExpandArray, transform.NewExpandArrayTransform()})
 
-	// 11. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
+	// 12. ON CONFLICT handling (strips ON CONFLICT in DuckLake mode since constraints don't exist)
 	t.transforms = append(t.transforms, taggedTransform{FlagOnConflict, transform.NewOnConflictTransformWithConfig(cfg.DuckLakeMode)})
 
-	// 12. Locking clause removal (FOR UPDATE, FOR SHARE, etc.) - DuckDB doesn't support these
+	// 13. Locking clause removal (FOR UPDATE, FOR SHARE, etc.) - DuckDB doesn't support these
 	t.transforms = append(t.transforms, taggedTransform{FlagLocking, transform.NewLockingTransform()})
 
-	// 13. ctid → rowid mapping (PostgreSQL system column to DuckDB equivalent)
+	// 14. ctid → rowid mapping (PostgreSQL system column to DuckDB equivalent)
 	t.transforms = append(t.transforms, taggedTransform{FlagCtid, transform.NewCtidTransform()})
 
 	// DDL transforms only when DuckLake mode is enabled
@@ -245,6 +256,16 @@ func (t *Transpiler) transpileWithFlags(sql string, flags TransformFlags) (*Resu
 	// DuckDB compatibility fixups on the AST before deparsing
 	fixupAST(tree)
 
+	if transformResult.SQLOverride != "" {
+		return &Result{
+			SQL:          transformResult.SQLOverride,
+			ParamCount:   transformResult.ParamCount,
+			IsNoOp:       transformResult.IsNoOp,
+			NoOpTag:      transformResult.NoOpTag,
+			IsIgnoredSet: transformResult.IsIgnoredSet,
+		}, nil
+	}
+
 	// Deparse the modified AST back to SQL
 	deparsed, err := pg_query.Deparse(tree)
 	if err != nil {
@@ -313,6 +334,13 @@ func Classify(sql string, cfg Config) Classification {
 	// public.table references (but not catalog.public.table which is 3-part)
 	if strings.Contains(upper, "PUBLIC.") {
 		flags |= FlagPublicSchema
+	}
+
+	if cfg.LogicalDatabaseName != "" || threePartIdentPattern.MatchString(sql) {
+		logicalUpper := strings.ToUpper(cfg.LogicalDatabaseName)
+		if cfg.LogicalDatabaseName == "" || containsAny(upper, logicalUpper+".", `"`+logicalUpper+`".`) || threePartIdentPattern.MatchString(sql) {
+			flags |= FlagLogicalCatalog
+		}
 	}
 
 	// version() function
@@ -384,6 +412,10 @@ func Classify(sql string, cfg Config) Classification {
 		"CURRENT_USER", "CURRENT_CATALOG(", "SESSION_USER",
 	) {
 		flags |= FlagFuncAlias
+	}
+
+	if NeedsBooleanPredicateRewrite(sql) {
+		flags |= FlagBooleanPredicates
 	}
 
 	// Operators: JSON arrows and regex.

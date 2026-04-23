@@ -16,8 +16,7 @@ import (
 // duckLakeSpecVersion is the DuckLake spec version that this build of duckgres expects.
 // When the metadata store is at an older version, we backup and migrate automatically.
 // This must match the DuckLake version bundled with the current DuckDB driver.
-// DuckDB 1.5.x ships DuckLake 0.4 which supports AUTOMATIC_MIGRATION.
-const duckLakeSpecVersion = "0.4"
+const duckLakeSpecVersion = "1.0"
 
 // dlMigration holds the result of the migration check.
 // The check retries on transient errors (e.g., metadata store not reachable yet)
@@ -515,10 +514,33 @@ func formatSQLValue(v any) string {
 	}
 }
 
+// injectPostgresKeepalive adds TCP keepalive parameters to a postgres metadata
+// store connection string if they are not already present. Without keepalives,
+// idle connections through AWS infrastructure (NAT gateways, security group
+// connection tracking, NLBs) are silently dropped after ~350 seconds, causing
+// "SSL connection has been closed unexpectedly" errors on the next query.
+//
+// Only modifies strings with the "postgres:" prefix. The keepalive parameters
+// are standard libpq options passed through DuckDB's postgres scanner.
+func injectPostgresKeepalive(metadataStore string) string {
+	if !strings.HasPrefix(metadataStore, "postgres:") {
+		return metadataStore
+	}
+	connPart := metadataStore[len("postgres:"):]
+	// Don't override if the user has already set keepalive parameters.
+	if strings.Contains(connPart, "keepalives") {
+		return metadataStore
+	}
+	// keepalives_idle=60 sends the first probe after 60s of idle time, well
+	// under the 350s AWS idle timeout. keepalives_interval=10 and
+	// keepalives_count=5 detect a dead peer within ~110s total.
+	return metadataStore + " keepalives=1 keepalives_idle=60 keepalives_interval=10 keepalives_count=5"
+}
+
 // buildDuckLakeAttachStmt builds the ATTACH statement for DuckLake.
 // If migrate is true, adds AUTOMATIC_MIGRATION TRUE to the options.
 func buildDuckLakeAttachStmt(dlCfg DuckLakeConfig, migrate bool) string {
-	connStr := escapeSQLStringLiteral(dlCfg.MetadataStore)
+	connStr := escapeSQLStringLiteral(injectPostgresKeepalive(dlCfg.MetadataStore))
 	dataPath := dlCfg.ObjectStore
 	if dataPath == "" {
 		dataPath = dlCfg.DataPath

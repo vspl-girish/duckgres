@@ -19,6 +19,7 @@ func (r *reconnectTestOrgRouter) StackForOrg(orgID string) (WorkerPool, *Session
 }
 
 func (r *reconnectTestOrgRouter) IsMigratingForOrg(_ string) bool { return false }
+func (r *reconnectTestOrgRouter) SetWarmCapacityTarget(_ int)     {}
 func (r *reconnectTestOrgRouter) ShutdownAll()                    {}
 
 func TestOrgRoutedSessionProviderReconnectSessionUsesDurableOrgID(t *testing.T) {
@@ -42,6 +43,7 @@ func TestOrgRoutedSessionProviderReconnectSessionUsesDurableOrgID(t *testing.T) 
 	})
 	if err == nil {
 		t.Fatal("expected reconnect to fail without a live org stack")
+		return
 	}
 	if pid != 0 {
 		t.Fatalf("expected pid 0 on failed reconnect, got %d", pid)

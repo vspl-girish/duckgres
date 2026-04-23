@@ -66,6 +66,8 @@ func (s *fakeAPIStore) UpdateOrg(name string, updates configstore.Org) (*configs
 	org.MaxWorkers = updates.MaxWorkers
 	org.MemoryBudget = updates.MemoryBudget
 	org.IdleTimeoutS = updates.IdleTimeoutS
+	org.WorkerCPURequest = updates.WorkerCPURequest
+	org.WorkerMemoryRequest = updates.WorkerMemoryRequest
 	return copyOrg(org), true, nil
 }
 
@@ -419,6 +421,7 @@ func TestPutWarehouseUpsertsForExistingOrg(t *testing.T) {
 	warehouse := store.warehouses["analytics"]
 	if warehouse == nil {
 		t.Fatal("expected stored warehouse")
+		return
 	}
 	if warehouse.OrgID != "analytics" {
 		t.Fatalf("expected org_id analytics, got %q", warehouse.OrgID)
@@ -562,6 +565,7 @@ func TestPutWarehouseAllowsCustomProvisioningStates(t *testing.T) {
 	warehouse := store.warehouses["analytics"]
 	if warehouse == nil {
 		t.Fatal("expected stored warehouse")
+		return
 	}
 	if warehouse.State != "awaiting-human-approval" {
 		t.Fatalf("expected custom overall state, got %q", warehouse.State)

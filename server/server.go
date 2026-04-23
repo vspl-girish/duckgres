@@ -38,13 +38,35 @@ var processVersion = "dev"
 // clients pinning connection goroutines indefinitely.
 var startupReadTimeout = 30 * time.Second
 
-const bundledDuckDBExtensionsDir = "/app/extensions"
+var bundledDuckDBExtensionsDir = "/app/extensions"
+
+var bundledExtensionBootstrap struct {
+	mu     sync.Mutex
+	byPath map[string]error
+}
 
 // SetProcessVersion sets the version string for this process. Called from main().
 func SetProcessVersion(v string) { processVersion = v }
 
 // ProcessVersion returns the version string for this process.
 func ProcessVersion() string { return processVersion }
+
+func bootstrapBundledExtensions(dataDir string) error {
+	extDir := filepath.Join(dataDir, "extensions")
+
+	bundledExtensionBootstrap.mu.Lock()
+	defer bundledExtensionBootstrap.mu.Unlock()
+	if bundledExtensionBootstrap.byPath == nil {
+		bundledExtensionBootstrap.byPath = make(map[string]error)
+	}
+	if err, ok := bundledExtensionBootstrap.byPath[extDir]; ok {
+		return err
+	}
+
+	err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir)
+	bundledExtensionBootstrap.byPath[extDir] = err
+	return err
+}
 
 // passwordPattern matches password=<value> or password: <value> with quoted or unquoted values.
 var passwordPattern = regexp.MustCompile(`(?i)(password\s*[=:]\s*)("[^"]*"|[^\s"]+)`)
@@ -54,16 +76,23 @@ var connectionsGauge = promauto.NewGauge(prometheus.GaugeOpts{
 	Help: "Number of currently open client connections",
 })
 
-var queryDurationHistogram = promauto.NewHistogram(prometheus.HistogramOpts{
+// IncrementOpenConnections increments the open connections gauge.
+// Used by the control plane which handles connections separately from the standalone server.
+func IncrementOpenConnections() { connectionsGauge.Inc() }
+
+// DecrementOpenConnections decrements the open connections gauge.
+func DecrementOpenConnections() { connectionsGauge.Dec() }
+
+var queryDurationHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
 	Name:    "duckgres_query_duration_seconds",
 	Help:    "Query execution duration in seconds",
-	Buckets: prometheus.DefBuckets,
-})
+	Buckets: []float64{0.1, 0.5, 1, 2, 5, 10, 30, 60, 120, 300, 600, 1800, 3600, 7200, 18000, 36000},
+}, []string{"org"})
 
-var queryErrorsCounter = promauto.NewCounter(prometheus.CounterOpts{
+var queryErrorsCounter = promauto.NewCounterVec(prometheus.CounterOpts{
 	Name: "duckgres_query_errors_total",
 	Help: "Total number of failed queries",
-})
+}, []string{"org"})
 
 var authFailuresCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_auth_failures_total",
@@ -84,6 +113,44 @@ var queryCancellationsCounter = promauto.NewCounter(prometheus.CounterOpts{
 	Name: "duckgres_query_cancellations_total",
 	Help: "Total number of queries cancelled via cancel request",
 })
+
+var ducklakeConflictTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_total",
+	Help: "Total number of DuckLake transaction conflicts encountered",
+})
+
+var ducklakeConflictRetriesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retries_total",
+	Help: "Total number of DuckLake transaction conflict retry attempts",
+})
+
+var ducklakeConflictRetrySuccessesTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retry_successes_total",
+	Help: "Total number of DuckLake transaction conflict retries that succeeded",
+})
+
+var ducklakeConflictRetriesExhaustedTotal = promauto.NewCounter(prometheus.CounterOpts{
+	Name: "duckgres_ducklake_conflict_retries_exhausted_total",
+	Help: "Total number of DuckLake transaction conflicts where all retries were exhausted",
+})
+
+var s3BytesReadTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+	Name: "duckgres_s3_bytes_read_total",
+	Help: "Total bytes read from S3 by DuckDB",
+}, []string{"org"})
+
+var scanWallSecondsHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name:    "duckgres_scan_wall_seconds",
+	Help:    "Estimated wall-clock scan time per query",
+	Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 30, 60},
+}, []string{"org"})
+
+var scanRowsPerSecondHistogram = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	Name: "duckgres_scan_rows_per_second",
+	Help: "Scan throughput: estimated wall-clock rows scanned per second. High values (>1e10) indicate buffer pool/cache hits.",
+	// Range spans S3 cold reads (1e5-1e8) through in-memory cache hits (1e9-1e12).
+	Buckets: []float64{1e5, 5e5, 1e6, 5e6, 1e7, 5e7, 1e8, 5e8, 1e9, 1e10, 1e11, 1e12},
+}, []string{"org"})
 
 // BackendKey uniquely identifies a backend connection for cancel requests
 type BackendKey struct {
@@ -159,6 +226,11 @@ type Config struct {
 	// This prevents accumulation of zombie connections from clients that disconnect
 	// uncleanly. Default: 24 hours. Set to a negative value (e.g., -1) to disable.
 	IdleTimeout time.Duration
+
+	// FilePersistence stores DuckDB data in <DataDir>/<username>.duckdb instead of :memory:.
+	// DuckDB memory-maps the file and serves queries from RAM, so performance is similar
+	// to in-memory mode while data persists across connections and restarts.
+	FilePersistence bool
 
 	// ProcessIsolation enables spawning each client connection in a separate OS process.
 	// This prevents DuckDB C++ crashes from taking down the entire server.
@@ -243,6 +315,13 @@ type DuckLakeConfig struct {
 	// Format: "postgres:host=<host> user=<user> password=<password> dbname=<db>"
 	MetadataStore string
 
+	// DisableMetadataThreadLocalCache disables postgres_scanner thread-local
+	// connection caching for the hidden DuckLake metadata pool as early as
+	// possible, before ATTACH creates that pool. This trades some warm-reuse
+	// performance for a lower retained metadata-connection footprint.
+	// Nil means use the server default (enabled).
+	DisableMetadataThreadLocalCache *bool
+
 	// ObjectStore is the S3-compatible storage path for DuckLake data files
 	// Format: "s3://bucket/path/" for S3/MinIO
 	// If not specified, uses DataPath for local storage
@@ -272,6 +351,12 @@ type DuckLakeConfig struct {
 	S3Chain   string // e.g., "env;config" to check env vars then config files
 	S3Profile string // AWS profile name to use (for "config" chain)
 
+	// HTTPProxy routes DuckDB httpfs traffic through a forward HTTP proxy.
+	// When set, DuckDB signs S3 requests for the real S3 hostname and sends them
+	// through the proxy as plain HTTP (requires S3UseSSL=false). Used by the
+	// local cache proxy DaemonSet for NVMe caching.
+	HTTPProxy string
+
 	// CheckpointInterval controls how often DuckLake CHECKPOINT runs.
 	// CHECKPOINT performs full catalog maintenance: expire snapshots,
 	// merge adjacent files, rewrite data files, and clean up orphaned files.
@@ -288,6 +373,14 @@ type DuckLakeConfig struct {
 	// re-running the version check. This avoids redundant backups and
 	// long-running checks in worker processes.
 	Migrate bool `json:"migrate,omitempty" yaml:"-"`
+}
+
+// fileDBEntry tracks a shared *sql.DB for file-persistence mode.
+// One entry per user file; multiple PG connections share the pool via pinned *sql.Conn.
+type fileDBEntry struct {
+	db          *sql.DB
+	refs        int
+	stopRefresh func() // credential refresh goroutine
 }
 
 type Server struct {
@@ -326,6 +419,11 @@ type Server struct {
 
 	// Query logger for DuckLake system.query_log
 	queryLogger *QueryLogger
+
+	// Per-user shared DB pool for file persistence mode.
+	// Each user gets one *sql.DB; PG connections share it via pinned *sql.Conn.
+	fileDBsMu sync.Mutex
+	fileDBs   map[string]*fileDBEntry
 
 	// DuckLake checkpoint scheduler
 	checkpointer *DuckLakeCheckpointer
@@ -381,6 +479,7 @@ func New(cfg Config) (*Server, error) {
 		activeQueries: make(map[BackendKey]context.CancelFunc),
 		duckLakeSem:   make(chan struct{}, 1),
 		conns:         make(map[int32]*clientConn),
+		fileDBs:       make(map[string]*fileDBEntry),
 	}
 
 	// Configure TLS: ACME DNS-01, ACME HTTP-01, or static certificate files
@@ -434,6 +533,10 @@ func New(cfg Config) (*Server, error) {
 	// since they both attach DuckLake and need to know if migration is required.
 	if cfg.DuckLake.MetadataStore != "" {
 		ensureDuckLakeMigrationCheck(cfg.DuckLake, cfg.DataDir)
+	}
+
+	if err := bootstrapBundledExtensions(cfg.DataDir); err != nil {
+		slog.Warn("Failed to bootstrap bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", filepath.Join(cfg.DataDir, "extensions"), "error", err)
 	}
 
 	// Initialize query logger (non-fatal on error)
@@ -702,11 +805,85 @@ func (s *Server) createDBConnection(username string) (*sql.DB, error) {
 	return CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
 }
 
-// openBaseDB creates and configures a bare DuckDB in-memory connection with
-// threads, memory limit, temp directory, extensions, and cache_httpfs settings.
+// acquireFileDB returns a shared *sql.DB for the given user, creating one if needed.
+// The caller must call releaseFileDB when the connection is no longer needed.
+func (s *Server) acquireFileDB(username string, passthrough bool) (*sql.DB, error) {
+	s.fileDBsMu.Lock()
+	defer s.fileDBsMu.Unlock()
+
+	if entry, ok := s.fileDBs[username]; ok {
+		entry.refs++
+		return entry.db, nil
+	}
+
+	var db *sql.DB
+	var err error
+	if passthrough {
+		db, err = CreatePassthroughDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
+	} else {
+		db, err = CreateDBConnection(s.cfg, s.duckLakeSem, username, processStartTime, processVersion)
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// openBaseDB sets MaxOpenConns(1) for single-session use; override for shared pool.
+	db.SetMaxOpenConns(0) // unlimited
+	db.SetMaxIdleConns(4)
+
+	stopRefresh := StartCredentialRefresh(db, s.cfg.DuckLake)
+
+	s.fileDBs[username] = &fileDBEntry{
+		db:          db,
+		refs:        1,
+		stopRefresh: stopRefresh,
+	}
+	return db, nil
+}
+
+// releaseFileDB decrements the ref count for a user's shared DB.
+// When the last reference is released, the DB is closed and removed from the pool.
+func (s *Server) releaseFileDB(username string) {
+	s.fileDBsMu.Lock()
+	defer s.fileDBsMu.Unlock()
+
+	entry, ok := s.fileDBs[username]
+	if !ok {
+		return
+	}
+	entry.refs--
+	if entry.refs <= 0 {
+		if entry.stopRefresh != nil {
+			entry.stopRefresh()
+		}
+		_ = entry.db.Close()
+		delete(s.fileDBs, username)
+	}
+}
+
+// openBaseDB creates and configures a DuckDB connection with threads, memory
+// limit, temp directory, extensions, and cache_httpfs settings.
 // This shared setup is used by both regular and passthrough connections.
+//
+// When DataDir is set, the database is file-backed at <DataDir>/<username>.duckdb.
+// DuckDB memory-maps the file and serves queries from RAM (like Redis with AOF),
+// so performance is equivalent to in-memory while data persists across restarts.
+// When DataDir is empty, falls back to a pure in-memory database.
 func openBaseDB(cfg Config, username string) (*sql.DB, error) {
-	db, err := sql.Open("duckdb", ":memory:")
+	// allow_unsigned_extensions is a startup-only DuckDB config — it must be
+	// in the DSN, not via SET.
+	dsn := ":memory:?allow_unsigned_extensions=true"
+	if cfg.FilePersistence && cfg.DataDir != "" && username != "" {
+		if strings.ContainsAny(username, "/\\") || strings.Contains(username, "..") {
+			return nil, fmt.Errorf("invalid username for file persistence: %q (contains path separator or ..)", username)
+		}
+		if err := os.MkdirAll(cfg.DataDir, 0750); err != nil {
+			return nil, fmt.Errorf("failed to create data directory %s: %w", cfg.DataDir, err)
+		}
+		dsn = filepath.Join(cfg.DataDir, username+".duckdb") + "?allow_unsigned_extensions=true"
+		slog.Info("Opening file-backed DuckDB.", "path", dsn)
+	}
+	db, err := sql.Open("duckdb", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open duckdb: %w", err)
 	}
@@ -763,9 +940,6 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Set extension directory under DataDir so DuckDB doesn't rely on $HOME/.duckdb
 	// for autoloading/installing extensions.
 	extDir := filepath.Join(cfg.DataDir, "extensions")
-	if err := seedBundledExtensions(bundledDuckDBExtensionsDir, extDir); err != nil {
-		slog.Warn("Failed to seed bundled DuckDB extensions.", "source", bundledDuckDBExtensionsDir, "extension_directory", extDir, "error", err)
-	}
 	if _, err := db.Exec(fmt.Sprintf("SET extension_directory = '%s'", extDir)); err != nil {
 		slog.Warn("Failed to set DuckDB extension_directory.", "extension_directory", extDir, "error", err)
 	} else {
@@ -775,6 +949,21 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 	// Load configured extensions
 	if err := LoadExtensions(db, cfg.Extensions); err != nil {
 		slog.Warn("Failed to load some extensions.", "user", username, "error", err)
+	}
+
+	// Enable query profiling so per-query operator timing can be extracted
+	// and attached to OTEL trace spans. Standard mode adds sub-1% overhead
+	// (just clock_gettime per operator boundary).
+	// Output goes to a fixed temp file; in K8s mode the worker reads it
+	// after each query and sends it to the control plane via gRPC trailer.
+	if _, err := db.Exec("SET enable_profiling = 'json'"); err != nil {
+		slog.Warn("Failed to enable DuckDB profiling.", "error", err)
+	}
+	if _, err := db.Exec("SET profiling_mode = 'detailed'"); err != nil {
+		slog.Warn("Failed to set DuckDB profiling mode.", "error", err)
+	}
+	if _, err := db.Exec("SET profiling_output = '/tmp/duckgres-profiling.json'"); err != nil {
+		slog.Warn("Failed to set DuckDB profiling output path.", "error", err)
 	}
 
 	// Configure cache_httpfs cache directory if the extension is loaded.
@@ -839,36 +1028,52 @@ func seedBundledExtensions(srcRoot, dstRoot string) error {
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil
 		}
+		if err := os.MkdirAll(filepath.Dir(dstPath), 0o750); err != nil {
+			return err
+		}
 		if _, err := os.Stat(dstPath); err == nil {
-			return nil
+			if !shouldRefreshBundledExtension(path) {
+				return nil
+			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
 		}
 
-		srcFile, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-
-		dstFile, err := os.OpenFile(dstPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o640)
-		if err != nil {
-			_ = srcFile.Close()
-			return err
-		}
-		if _, err := io.Copy(dstFile, srcFile); err != nil {
-			_ = srcFile.Close()
-			_ = dstFile.Close()
-			return err
-		}
-		if err := srcFile.Close(); err != nil {
-			_ = dstFile.Close()
-			return err
-		}
-		if err := dstFile.Close(); err != nil {
-			return err
-		}
-		return nil
+		return copyFile(path, dstPath, info.Mode().Perm())
 	})
+}
+
+func shouldRefreshBundledExtension(srcPath string) bool {
+	return filepath.Base(srcPath) == "postgres_scanner.duckdb_extension"
+}
+
+func copyFile(srcPath, dstPath string, mode os.FileMode) error {
+	srcFile, err := os.Open(srcPath)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = srcFile.Close() }()
+
+	tmpFile, err := os.CreateTemp(filepath.Dir(dstPath), ".bundled-extension-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	defer func() { _ = os.Remove(tmpPath) }()
+
+	if err := tmpFile.Chmod(mode); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if _, err := io.Copy(tmpFile, srcFile); err != nil {
+		_ = tmpFile.Close()
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		return err
+	}
+
+	return os.Rename(tmpPath, dstPath)
 }
 
 // CreateDBConnection creates a DuckDB connection for a client session.
@@ -1096,6 +1301,83 @@ func LoadExtensions(db *sql.DB, extensions []string) error {
 	return lastErr
 }
 
+func boolPtr(v bool) *bool { return &v }
+
+func duckLakeDisableMetadataThreadLocalCacheEnabled(dlCfg DuckLakeConfig) bool {
+	if dlCfg.DisableMetadataThreadLocalCache == nil {
+		return true
+	}
+	return *dlCfg.DisableMetadataThreadLocalCache
+}
+
+func buildDuckLakePreAttachStatements(dlCfg DuckLakeConfig) []string {
+	var statements []string
+	if duckLakeDisableMetadataThreadLocalCacheEnabled(dlCfg) {
+		statements = append(statements, "SET GLOBAL pg_pool_enable_thread_local_cache = false")
+	}
+	return statements
+}
+
+type duckLakeSQLExecer interface {
+	Exec(query string, args ...any) (sql.Result, error)
+}
+
+func isMissingDuckLakePoolSettingError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "unrecognized configuration parameter")
+}
+
+func applyDuckLakePreAttachSettingsWith(db duckLakeSQLExecer, loadPostgresScanner func() error, dlCfg DuckLakeConfig) error {
+	statements := buildDuckLakePreAttachStatements(dlCfg)
+	if len(statements) == 0 {
+		return nil
+	}
+
+	for _, stmt := range statements {
+		if _, err := db.Exec(stmt); err != nil {
+			if isMissingDuckLakePoolSettingError(err) {
+				if loadErr := loadPostgresScanner(); loadErr != nil {
+					slog.Warn("DuckLake pre-attach pool setting unavailable; continuing without it.",
+						"statement", stmt, "error", loadErr)
+					continue
+				}
+				if _, retryErr := db.Exec(stmt); retryErr != nil {
+					if isMissingDuckLakePoolSettingError(retryErr) {
+						slog.Warn("DuckLake pre-attach pool setting still unavailable after loading postgres_scanner; continuing without it.",
+							"statement", stmt, "error", retryErr)
+						continue
+					}
+					return fmt.Errorf("apply DuckLake pre-attach setting %q after loading postgres_scanner: %w", stmt, retryErr)
+				}
+				continue
+			}
+			return fmt.Errorf("apply DuckLake pre-attach setting %q: %w", stmt, err)
+		}
+	}
+	return nil
+}
+
+func applyDuckLakePreAttachSettings(db *sql.DB, dlCfg DuckLakeConfig) error {
+	return applyDuckLakePreAttachSettingsWith(db, func() error {
+		return LoadExtensions(db, []string{"postgres_scanner"})
+	}, dlCfg)
+}
+
+func configureDuckLakeMetadataPool(db duckLakeSQLExecer) {
+	_, err := db.Exec(`SELECT * FROM postgres_configure_pool(
+		catalog_name := '__ducklake_metadata_ducklake',
+		enable_reaper_thread := true,
+		idle_timeout_millis := 60000,
+		max_lifetime_millis := 600000
+	)`)
+	if err != nil {
+		slog.Warn("Failed to configure DuckLake metadata pg pool.", "error", err)
+	}
+}
+
 // hasCacheHTTPFS checks if cache_httpfs is in the extensions list.
 func hasCacheHTTPFS(extensions []string) bool {
 	for _, ext := range extensions {
@@ -1247,6 +1529,35 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		}
 	}
 
+	// Route httpfs traffic through a forward HTTP proxy (cache proxy DaemonSet).
+	// DuckDB keeps SigV4 for the real S3 hostname; the proxy forwards the signed
+	// request verbatim, so the proxy needs no AWS credentials.
+	//
+	// Use SET GLOBAL http_proxy (not a scoped HTTP secret) — DuckDB's S3
+	// extension doesn't honor HTTP-secret SCOPE for S3 URLs, so proxying must
+	// be global. The proxy itself CONNECT-tunnels non-bucket HTTPS traffic
+	// (e.g. read_parquet('https://...')) and only caches DuckLake bucket URLs.
+	//
+	// Set BEFORE the ATTACH so the proxy is in effect for the initial catalog
+	// read (some settings don't propagate to DuckLake's subcatalogs post-attach,
+	// same gotcha as pg_pool_max_connections).
+	if dlCfg.HTTPProxy != "" {
+		// Force plaintext HTTP + path-style at the session level in addition to
+		// the S3 secret's USE_SSL/URL_STYLE — DuckDB observed to ignore secret
+		// settings and tunnel via HTTPS CONNECT when the endpoint looks like AWS
+		// S3, which the proxy can't cache (encrypted tunnel).
+		for _, stmt := range []string{
+			fmt.Sprintf("SET GLOBAL http_proxy = '%s'", dlCfg.HTTPProxy),
+			"SET GLOBAL s3_use_ssl = false",
+			"SET GLOBAL s3_url_style = 'path'",
+		} {
+			if _, err := db.Exec(stmt); err != nil {
+				slog.Warn("Failed to set httpfs proxy config.", "stmt", stmt, "error", err)
+			}
+		}
+		slog.Info("Routed httpfs traffic through forward HTTP proxy.", "proxy", dlCfg.HTTPProxy)
+	}
+
 	// Warn if metadata store appears to connect via pgbouncer.
 	// pgbouncer's connection lifecycle management (idle timeout, server_lifetime, etc.)
 	// can kill connections that DuckLake's internal metadata database depends on,
@@ -1261,6 +1572,9 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 
 	// Build the ATTACH statement.
 	// See: https://ducklake.select/docs/stable/duckdb/usage/connecting
+	if err := applyDuckLakePreAttachSettings(db, dlCfg); err != nil {
+		return err
+	}
 	migrate := dlCfg.Migrate || duckLakeMigrationNeeded()
 	attachStmt := buildDuckLakeAttachStmt(dlCfg, migrate)
 
@@ -1279,12 +1593,15 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		slog.Info("Attaching DuckLake catalog.", "metadata", redactConnectionString(dlCfg.MetadataStore))
 	}
 
+	_, attachSpan := tracer.Start(context.Background(), "duckgres.ducklake_attach")
 	if err := retryOnTransientAttach(func() error {
 		_, err := db.Exec(attachStmt)
 		return err
 	}); err != nil {
+		attachSpan.End()
 		return fmt.Errorf("failed to attach DuckLake: %w", err)
 	}
+	attachSpan.End()
 
 	slog.Info("Attached DuckLake catalog successfully.")
 
@@ -1296,6 +1613,21 @@ func AttachDuckLake(db *sql.DB, dlCfg DuckLakeConfig, sem chan struct{}, dataDir
 		slog.Warn("Failed to set ducklake_max_retry_count.", "error", err)
 		// Don't fail - this is not critical, DuckLake will use its default
 	}
+
+	// Reclaim idle metadata connections. DuckDB 1.5.2 / DuckLake 1.0 enabled
+	// thread-local connection caching for postgres_scanner by default but ships
+	// with reaper_thread=off and idle/lifetime timeouts=0, so every connection
+	// a worker thread ever caches stays pinned forever — producing a steady-state
+	// spike in metadata RDS connections post-upgrade. Enabling the reaper with a
+	// 60s idle timeout reclaims idle cached connections while keeping the warm-
+	// connection latency benefit for active workers; the 10-min max lifetime is
+	// a belt-and-braces cap against stuck connections (NAT churn, pgbouncer kills).
+	//
+	// postgres_configure_pool() reconfigures the pool that ATTACH already created;
+	// SET GLOBAL only affects pools created after it runs, so would be a no-op here.
+	// See: https://github.com/duckdb/ducklake/issues/1031 and
+	// https://github.com/duckdb/duckdb-postgres/pull/430
+	configureDuckLakeMetadataPool(db)
 
 	// Ensure performance indexes exist on the DuckLake metadata tables.
 	// Run in a goroutine so it doesn't block the DuckLake semaphore or

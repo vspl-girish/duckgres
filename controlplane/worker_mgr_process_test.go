@@ -347,6 +347,7 @@ func TestAcquireWorkerSpawnsWhenBelowCapacity(t *testing.T) {
 	_, err := pool.AcquireWorker(context.Background())
 	if err == nil {
 		t.Fatal("expected spawn error with non-existent binary")
+		return
 	}
 	// The error should be a spawn error, not a "no worker found" error.
 	if pool.nextWorkerID <= 1 {
@@ -384,6 +385,7 @@ func TestAcquireWorkerCleansDeadWorkersWhenAllDead(t *testing.T) {
 	// Will fail to spawn since no real binary, but dead workers should be cleaned.
 	if err == nil {
 		t.Fatal("expected spawn error")
+		return
 	}
 
 	pool.mu.RLock()
@@ -408,6 +410,7 @@ func TestAcquireWorkerUnlimitedWhenMaxZero(t *testing.T) {
 	// it didn't block.
 	if err == nil {
 		t.Fatal("expected spawn error with non-existent binary")
+		return
 	}
 }
 
@@ -418,6 +421,7 @@ func TestAcquireWorkerShutdownReturnsError(t *testing.T) {
 	_, err := pool.AcquireWorker(context.Background())
 	if err == nil {
 		t.Fatal("expected error after shutdown")
+		return
 	}
 }
 
@@ -468,6 +472,44 @@ func TestRetireWorkerIfNoSessions_RetiresWhenLastSession(t *testing.T) {
 
 	if _, ok := pool.Worker(1); ok {
 		t.Fatal("worker should have been retired")
+	}
+}
+
+func TestReleaseWorker_RetiresWhenLastSessionAndEnabled(t *testing.T) {
+	pool := NewFlightWorkerPool(t.TempDir(), "", 0, 1)
+	pool.retireOnSessionEnd = true
+
+	w, cleanup := makeFakeWorker(t, 1)
+	defer cleanup()
+	w.activeSessions = 1
+
+	pool.mu.Lock()
+	pool.workers[1] = w
+	pool.mu.Unlock()
+
+	pool.ReleaseWorker(1)
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, ok := pool.Worker(1); ok {
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		select {
+		case <-w.done:
+			return
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	if _, ok := pool.Worker(1); ok {
+		t.Fatal("worker should have been retired after its last session ended")
+	}
+	select {
+	case <-w.done:
+	default:
+		t.Fatal("worker process should have exited after retire-on-session-end")
 	}
 }
 
@@ -784,6 +826,7 @@ func TestPreBindSocketsCleanupOnPartialFailure(t *testing.T) {
 	err := pool.PreBindSockets(3)
 	if err == nil {
 		t.Fatal("expected PreBindSockets to fail")
+		return
 	}
 
 	pool.preboundMu.Lock()

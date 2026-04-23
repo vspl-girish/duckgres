@@ -29,6 +29,84 @@ type testExecResult struct {
 	err      error
 }
 
+type serializingRecoveryFlightExecutor struct {
+	firstQuery      string
+	interloperQuery string
+	firstFailedCh   chan struct{}
+	rollbackStarted chan struct{}
+	releaseRollback chan struct{}
+	interloperHitCh chan struct{}
+	firstQueryCalls atomic.Int32
+}
+
+type testStatementUpdate struct {
+	query         string
+	transactionID []byte
+}
+
+func (u testStatementUpdate) GetQuery() string {
+	return u.query
+}
+
+func (u testStatementUpdate) GetTransactionId() []byte {
+	return u.transactionID
+}
+
+func (e *serializingRecoveryFlightExecutor) QueryContext(context.Context, string, ...any) (server.RowSet, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (e *serializingRecoveryFlightExecutor) ExecContext(_ context.Context, query string, _ ...any) (server.ExecResult, error) {
+	switch query {
+	case e.firstQuery:
+		if e.firstQueryCalls.Add(1) == 1 {
+			close(e.firstFailedCh)
+			return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+		}
+		return testExecResult{affected: 1}, nil
+	case "ROLLBACK":
+		close(e.rollbackStarted)
+		<-e.releaseRollback
+		return testExecResult{}, nil
+	case e.interloperQuery:
+		select {
+		case <-e.interloperHitCh:
+		default:
+			close(e.interloperHitCh)
+		}
+		return testExecResult{affected: 1}, nil
+	default:
+		return testExecResult{affected: 1}, nil
+	}
+}
+
+type beginTxnRaceFlightExecutor struct {
+	interloperQuery string
+	rollbackHitCh   chan struct{}
+}
+
+func (e *beginTxnRaceFlightExecutor) QueryContext(context.Context, string, ...any) (server.RowSet, error) {
+	return nil, fmt.Errorf("not implemented")
+}
+
+func (e *beginTxnRaceFlightExecutor) ExecContext(_ context.Context, query string, _ ...any) (server.ExecResult, error) {
+	switch query {
+	case "BEGIN TRANSACTION":
+		return testExecResult{}, nil
+	case e.interloperQuery:
+		return nil, errors.New("TransactionContext Error: Current transaction is aborted (please ROLLBACK)")
+	case "ROLLBACK":
+		select {
+		case <-e.rollbackHitCh:
+		default:
+			close(e.rollbackHitCh)
+		}
+		return testExecResult{}, nil
+	default:
+		return testExecResult{}, nil
+	}
+}
+
 type captureDurableSessionStore struct {
 	mu      sync.Mutex
 	records map[string]DurableSessionRecord
@@ -314,6 +392,129 @@ func TestRowsAffectedOrErrorReturnsAffectedCount(t *testing.T) {
 	}
 }
 
+func TestDoPutCommandStatementUpdateKeepsRecoverySerializedPerSession(t *testing.T) {
+	exec := &serializingRecoveryFlightExecutor{
+		firstQuery:      "UPDATE t SET x = 1",
+		interloperQuery: "UPDATE interloper SET x = 1",
+		firstFailedCh:   make(chan struct{}),
+		rollbackStarted: make(chan struct{}),
+		releaseRollback: make(chan struct{}),
+		interloperHitCh: make(chan struct{}),
+	}
+
+	session := newFlightClientSession(1234, "postgres", nil)
+	session.execFn = exec.ExecContext
+	session.token = "issued-token"
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			session.token: session,
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.token))
+	cmd := testStatementUpdate{query: exec.firstQuery}
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, callErr := h.DoPutCommandStatementUpdate(ctx, cmd)
+		errCh <- callErr
+	}()
+
+	go func() {
+		<-exec.firstFailedCh
+		_, _ = session.exec(context.Background(), exec.interloperQuery)
+	}()
+
+	select {
+	case <-exec.rollbackStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for rollback to start")
+	}
+
+	select {
+	case <-exec.interloperHitCh:
+		t.Fatal("interloper query reached executor before recovery finished")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(exec.releaseRollback)
+
+	select {
+	case callErr := <-errCh:
+		if callErr != nil {
+			t.Fatalf("expected nil error, got %v", callErr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for statement update to finish")
+	}
+}
+
+func TestBeginTransactionPublishesTxnStateBeforeConcurrentRecoveryDecidesRollback(t *testing.T) {
+	exec := &beginTxnRaceFlightExecutor{
+		interloperQuery: "UPDATE interloper SET x = 1",
+		rollbackHitCh:   make(chan struct{}),
+	}
+
+	session := newFlightClientSession(1234, "postgres", nil)
+	session.execFn = exec.ExecContext
+	session.token = "issued-token"
+	store := &flightAuthSessionStore{
+		sessions: map[string]*flightClientSession{
+			session.token: session,
+		},
+	}
+
+	h, err := NewControlPlaneFlightSQLHandler(store, &MapCredentialValidator{Users: map[string]string{"postgres": "postgres"}})
+	if err != nil {
+		t.Fatalf("failed to construct handler: %v", err)
+	}
+
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("x-duckgres-session", session.token))
+	interloperDone := make(chan error, 1)
+	session.afterTxnControlExecHook = func(query string) {
+		if query != "BEGIN TRANSACTION" {
+			return
+		}
+		go func() {
+			_, callErr := session.exec(context.Background(), exec.interloperQuery)
+			interloperDone <- callErr
+		}()
+	}
+
+	txnID, err := h.BeginTransaction(ctx, nil)
+	if err != nil {
+		t.Fatalf("BeginTransaction returned error: %v", err)
+	}
+	if len(txnID) == 0 {
+		t.Fatal("expected non-empty transaction id")
+	}
+
+	select {
+	case callErr := <-interloperDone:
+		if callErr == nil {
+			t.Fatal("expected interloper to see aborted-transaction error")
+			return
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for interloper call")
+	}
+
+	select {
+	case <-exec.rollbackHitCh:
+		t.Fatal("interloper issued rollback against active user transaction")
+	default:
+	}
+
+	if !session.hasTxn(string(txnID)) {
+		t.Fatal("expected transaction bookkeeping to remain present")
+	}
+}
+
 func TestFlightAuthSessionKeyStableAcrossPeerPorts(t *testing.T) {
 	ctx1 := peer.NewContext(context.Background(), &peer.Peer{
 		Addr: &net.TCPAddr{IP: net.ParseIP("203.0.113.10"), Port: 40000},
@@ -369,6 +570,7 @@ func TestSessionFromContextAcceptsServerIssuedSessionTokenWithoutBasicAuth(t *te
 	}
 	if got == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 	if got != s {
 		t.Fatalf("expected existing token session to be reused")
@@ -652,6 +854,7 @@ func TestFlightSessionTokenLifecycleIssueValidateRevokeExpiryMatrix(t *testing.T
 		}
 		if issued == nil {
 			t.Fatalf("expected non-nil issued session")
+			return
 		}
 		if strings.TrimSpace(issued.token) == "" {
 			t.Fatalf("expected non-empty issued token")
@@ -770,6 +973,7 @@ func TestFlightAuthSessionStorePersistsDurableSessionRecordOnCreate(t *testing.T
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to be persisted")
+		return
 	}
 	if record.Username != "postgres" {
 		t.Fatalf("expected username postgres, got %q", record.Username)
@@ -851,6 +1055,7 @@ func TestFlightAuthSessionStoreReconnectsDurableSessionByToken(t *testing.T) {
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to remain present")
+		return
 	}
 	if record.State != DurableSessionStateActive {
 		t.Fatalf("expected durable session to remain active, got %q", record.State)
@@ -947,6 +1152,7 @@ func TestFlightAuthSessionStoreReconnectRefreshesDurableSessionMetadata(t *testi
 	}
 	if record == nil {
 		t.Fatal("expected durable session record to be present")
+		return
 	}
 	if record.OwnerEpoch != 5 {
 		t.Fatalf("expected refreshed owner epoch 5, got %d", record.OwnerEpoch)
@@ -1013,6 +1219,7 @@ func TestFlightAuthSessionStoreReconnectFailureUpdatesDurableSessionState(t *tes
 			}
 			if record == nil {
 				t.Fatal("expected durable session record to remain present")
+				return
 			}
 			if record.State != tt.wantState {
 				t.Fatalf("expected durable session state %q, got %q", tt.wantState, record.State)
@@ -1272,6 +1479,7 @@ func TestNewControlPlaneFlightSQLHandlerReturnsError(t *testing.T) {
 	}
 	if h == nil {
 		t.Fatalf("expected non-nil handler")
+		return
 	}
 }
 
@@ -1320,6 +1528,7 @@ func TestSessionFromContextSuccessIncrementsIngressSessionOutcomeMetric(t *testi
 	}
 	if s == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 	if after-before != 1 {
 		t.Fatalf("expected duckgres_flight_ingress_sessions_total{outcome=created} delta 1, got %.0f", after-before)
@@ -1336,6 +1545,7 @@ func TestRPCDurationMetricRecordsOnError(t *testing.T) {
 
 	if err == nil {
 		t.Fatalf("expected GetFlightInfoSchemas to fail without auth context")
+		return
 	}
 	if after-before != 1 {
 		t.Fatalf("expected duckgres_flight_rpc_duration_seconds sample count delta 1, got %d", after-before)
@@ -1388,6 +1598,7 @@ func TestSessionFromContextFailedAndSuccessfulAuthUpdateRateLimiter(t *testing.T
 	}
 	if s == nil {
 		t.Fatalf("expected non-nil session")
+		return
 	}
 
 	_, err = h.sessionFromContext(authContextForPeer(addr, "postgres", "wrong"))
