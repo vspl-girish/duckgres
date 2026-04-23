@@ -38,6 +38,7 @@ type FileConfig struct {
 	ProcessIsolation          bool                `yaml:"process_isolation"` // Enable process isolation per connection
 	IdleTimeout               string              `yaml:"idle_timeout"`      // e.g., "24h", "1h", "-1" to disable
 	MemoryLimit               string              `yaml:"memory_limit"`      // DuckDB memory_limit per session (e.g., "4GB")
+	TempDirectory             string              `yaml:"temp_directory"`    // DuckDB temp_directory (e.g., "/tmp/duckdb"); default: <data_dir>/tmp
 	Threads                   int                 `yaml:"threads"`           // DuckDB threads per session
 	MemoryBudget              string              `yaml:"memory_budget"`     // Total memory for all sessions (e.g., "24GB")
 	MemoryRebalance           *bool               `yaml:"memory_rebalance"`  // Enable dynamic per-connection memory reallocation

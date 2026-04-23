@@ -133,6 +133,7 @@ ducklake:
 # Auto-detected from system memory if not set.
 # memory_limit: "4GB"
 # threads: 4
+# temp_directory: "/tmp/duckdb"  # Default: <data_dir>/tmp
 
 # Dynamic memory allocation (control-plane mode only)
 # Total memory budget shared across all DuckDB sessions.

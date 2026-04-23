@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -168,6 +169,10 @@ type Config struct {
 	// MemoryLimit is the DuckDB memory_limit per session (e.g., "4GB").
 	// If empty, auto-detected from system memory.
 	MemoryLimit string
+
+	// TempDirectory is the DuckDB temp_directory path for spill-to-disk.
+	// If empty, defaults to <DataDir>/tmp.
+	TempDirectory string
 
 	// Threads is the DuckDB threads per session.
 	// If zero, defaults to runtime.NumCPU().
@@ -740,10 +745,15 @@ func openBaseDB(cfg Config, username string) (*sql.DB, error) {
 		slog.Debug("Set DuckDB memory_limit.", "memory_limit", memLimit)
 	}
 
-	// Set temp directory to a subdirectory under DataDir to ensure DuckDB has a
-	// writable location for intermediate results. This prevents "Read-only file system"
-	// errors in containerized or restricted environments.
-	tempDir := filepath.Join(cfg.DataDir, "tmp")
+	// Set temp directory for DuckDB spill-to-disk. Defaults to <DataDir>/tmp to ensure
+	// DuckDB has a writable location for intermediate results. This prevents "Read-only
+	// file system" errors in containerized or restricted environments.
+	// A unique suffix (<timeMs>_<randomInt>) is appended to avoid collisions between sessions.
+	tempBase := cfg.TempDirectory
+	if tempBase == "" {
+		tempBase = filepath.Join(cfg.DataDir, "tmp")
+	}
+	tempDir := fmt.Sprintf("%s_%d_%d", tempBase, time.Now().UnixMilli(), rand.Int())
 	if _, err := db.Exec(fmt.Sprintf("SET temp_directory = '%s'", tempDir)); err != nil {
 		slog.Warn("Failed to set DuckDB temp_directory.", "temp_directory", tempDir, "error", err)
 	} else {

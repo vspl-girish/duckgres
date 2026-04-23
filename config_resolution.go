@@ -296,6 +296,9 @@ func resolveEffectiveConfig(fileCfg *FileConfig, cli configCLIInputs, getenv fun
 		if fileCfg.MemoryLimit != "" {
 			cfg.MemoryLimit = fileCfg.MemoryLimit
 		}
+		if fileCfg.TempDirectory != "" {
+			cfg.TempDirectory = fileCfg.TempDirectory
+		}
 		if fileCfg.Threads != 0 {
 			cfg.Threads = fileCfg.Threads
 		}
