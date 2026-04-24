@@ -8,7 +8,10 @@ import (
 
 // InitSessionDatabaseMetadata installs session-local overrides for metadata
 // surfaces that should reflect the client-visible database name on pgwire.
-func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, database string) error {
+// defaultCatalog is the physical catalog to restore after creating temp views in
+// memory.main (mirrors the cfg.DefaultCatalog from ConfigureDBConnection). Pass ""
+// to fall back to "ducklake" when DuckLake is attached, or stay in memory otherwise.
+func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, database string, defaultCatalog string) error {
 	if executor == nil {
 		return fmt.Errorf("session executor is required")
 	}
@@ -33,10 +36,18 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, da
 	if _, err := executor.ExecContext(ctx, "USE memory"); err != nil {
 		return fmt.Errorf("switch to memory catalog: %w", err)
 	}
+
+	// Determine which catalog to restore after creating temp views in memory.main.
+	// Explicit defaultCatalog from config takes priority; fall back to ducklake when attached.
+	restoreCatalog := defaultCatalog
+	if restoreCatalog == "" && duckLakeAttached {
+		restoreCatalog = "ducklake"
+	}
+
 	defer func() {
-		if duckLakeAttached {
-			_, _ = executor.ExecContext(context.Background(), "USE ducklake")
-			// USE ducklake resets search_path to ducklake.main, excluding memory.main
+		if restoreCatalog != "" {
+			_, _ = executor.ExecContext(context.Background(), "USE "+restoreCatalog)
+			// USE <catalog> resets search_path to <catalog>.main, excluding memory.main
 			// where pg_catalog macros live. Restore it so macros remain resolvable.
 			_, _ = executor.ExecContext(context.Background(), "SET search_path = 'main,memory.main'")
 		}
@@ -51,8 +62,8 @@ func InitSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, da
 	return nil
 }
 
-func initSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, database string) error {
-	return InitSessionDatabaseMetadata(ctx, executor, database)
+func initSessionDatabaseMetadata(ctx context.Context, executor QueryExecutor, database string, defaultCatalog string) error {
+	return InitSessionDatabaseMetadata(ctx, executor, database, defaultCatalog)
 }
 
 func hasAttachedCatalog(ctx context.Context, executor QueryExecutor, catalog string) (bool, error) {

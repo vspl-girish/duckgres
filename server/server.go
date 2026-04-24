@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"net"
 	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -302,9 +302,9 @@ type QueryLogConfig struct {
 
 // AttachConfig describes a single DuckDB database to attach on connection setup.
 type AttachConfig struct {
-	Path     string // database file path or connection string
-	Alias    string // name to attach as (e.g. ATTACH '...' AS alias)
-	ReadOnly bool   // attach in read-only mode
+	Path             string // database file path or connection string
+	Alias            string // name to attach as (e.g. ATTACH '...' AS alias)
+	ReadOnly         bool   // attach in read-only mode
 	DataPath         string // DATA_PATH option (e.g. "s3://bucket/path/" or "/local/data")
 	OverrideDataPath bool   // OVERRIDE_DATA_PATH TRUE option
 }
@@ -1242,7 +1242,7 @@ func CreatePassthroughDBConnection(cfg Config, duckLakeSem chan struct{}, userna
 		defaultCatalog = "ducklake"
 	}
 	if defaultCatalog != "" {
-		if _, err := db.Exec("USE " + defaultCatalog); err != nil {
+		if _, err := db.Exec("USE " + defaultCatalog + ";"); err != nil {
 			_ = db.Close()
 			return nil, fmt.Errorf("failed to set default catalog %q: %w", defaultCatalog, err)
 		}

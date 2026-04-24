@@ -91,7 +91,7 @@ func TestInitSessionDatabaseMetadataOverridesCurrentDatabaseAndPgDatabase(t *tes
 	defer func() { _ = db.Close() }()
 
 	executor := NewLocalExecutor(db)
-	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
+	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics", ""); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -146,7 +146,7 @@ func TestInitSessionDatabaseMetadataOverridesInformationSchemaCatalogColumns(t *
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
+	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics", ""); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 
@@ -208,7 +208,7 @@ func TestInitSessionDatabaseMetadataExcludesInternalDuckLakeMetadataCatalogs(t *
 	}
 
 	executor := NewLocalExecutor(db)
-	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics"); err != nil {
+	if err := initSessionDatabaseMetadata(context.Background(), executor, "analytics", ""); err != nil {
 		t.Fatalf("init session database metadata: %v", err)
 	}
 

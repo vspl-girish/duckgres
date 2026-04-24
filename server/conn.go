@@ -821,7 +821,7 @@ func (c *clientConn) serve() error {
 
 	if !c.passthrough {
 		initCtx, initCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		if err := InitSessionDatabaseMetadata(initCtx, c.executor, c.database); err != nil {
+		if err := InitSessionDatabaseMetadata(initCtx, c.executor, c.database, c.server.cfg.DefaultCatalog); err != nil {
 			initCancel()
 			c.sendError("FATAL", "XX000", fmt.Sprintf("failed to initialize session database metadata: %v", err))
 			return err
